@@ -1,8 +1,31 @@
+# ── Core deep learning ──────────────────────────────────────────────────────
 torch>=2.0.0
-torch-geometric         # Essential for Graph Convolution
-pandas
-numpy
-osmnx                   # For the physical airport graphs
-geopandas               # For handling JFK/EWR shapefiles
-scikit-learn            # For the spectral clustering [cite: 152]
-matplotlib
+
+# ── Graph Neural Networks ──────────────────────────────────────────────────
+# Install PyG and its C++ extensions together:
+#   pip install torch-geometric torch-scatter torch-sparse \
+#               torch-cluster torch-spline-conv \
+#               -f https://data.pyg.org/whl/torch-<VERSION>+cu<CUDA>.html
+torch-geometric>=2.4.0
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+
+# ── Graph processing (NetworkX used for shortest-path distance in F2) ──────
+networkx>=3.0
+
+# ── Geospatial ─────────────────────────────────────────────────────────────
+osmnx>=1.6.0            # download airport layout graphs from OpenStreetMap
+geopandas>=0.13.0       # geographic data manipulation
+
+# ── Data science ────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0     # utilities (scalers, metrics)
+
+# ── Visualisation ───────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+tqdm>=4.65.0
