@@ -1,0 +1,8 @@
+torch>=2.0.0
+torch-geometric         # Essential for Graph Convolution
+pandas
+numpy
+osmnx                   # For the physical airport graphs
+geopandas               # For handling JFK/EWR shapefiles
+scikit-learn            # For the spectral clustering [cite: 152]
+matplotlib
