@@ -1,0 +1,11 @@
+{
+  "LGA": {
+    "Terminal_B": ["AA", "UA", "B6", "WN", "AC"],
+    "Terminal_C": ["DL", "WS"]
+  },
+  "EWR": {
+    "Terminal_A": ["UA", "AA", "DL", "B6", "AC"],
+    "Terminal_B": ["AS", "SY", "B6", "AI", "LH", "BA", "EK"],
+    "Terminal_C": ["UA"]
+  }
+}
