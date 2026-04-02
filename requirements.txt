@@ -2,15 +2,24 @@
 torch>=2.0.0
 
 # ── Graph Neural Networks ──────────────────────────────────────────────────
-# Install PyG and its C++ extensions together:
-#   pip install torch-geometric torch-scatter torch-sparse \
-#               torch-cluster torch-spline-conv \
-#               -f https://data.pyg.org/whl/torch-<VERSION>+cu<CUDA>.html
+# torch-geometric itself installs cleanly on all platforms.
 torch-geometric>=2.4.0
-torch-scatter
-torch-sparse
-torch-cluster
-torch-spline-conv
+
+# torch-scatter / torch-sparse / torch-cluster / torch-spline-conv
+# ──────────────────────────────────────────────────────────────────────────
+# These C++ extension wheels CANNOT be installed via a plain `pip install`
+# because they must match your exact PyTorch version and CUDA flavour.
+# Run the helper script instead (works on Windows, macOS, and Linux):
+#
+#   python install_pyg_deps.py
+#
+# Or manually (replace 2.2.2 and cpu/cu118/cu121 to match your setup):
+#
+#   pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
+#       -f https://data.pyg.org/whl/torch-2.2.2+cpu.html
+#
+# torch-geometric 2.4+ includes pure-Python fallbacks, so training will
+# still run without these wheels – they are optional speed-ups only.
 
 # ── Graph processing (NetworkX used for shortest-path distance in F2) ──────
 networkx>=3.0

@@ -169,6 +169,7 @@ ECE538FP/
 │   └── get_geo.py         Download airport GraphML from OSM
 ├── outputs/            Model checkpoints + results (generated)
 ├── requirements.txt
+├── install_pyg_deps.py  Auto-detects PyTorch version and installs C++ wheels
 └── README.md
 ```
 
@@ -177,12 +178,34 @@ ECE538FP/
 ## Quick Start
 
 ### 1. Install dependencies
+
+**Step 1 — core packages** (works on all platforms):
 ```bash
 pip install -r requirements.txt
-# PyG C++ extensions — match your torch/CUDA version:
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
-    -f https://data.pyg.org/whl/torch-$(python -c "import torch; print(torch.__version__)")+cpu.html
 ```
+
+**Step 2 — PyG C++ extension wheels** (must match your PyTorch version):
+
+> **Windows users:** the C++ extensions cannot be built from source on Windows.
+> Use the helper script — it auto-detects your PyTorch version and CUDA flavour
+> and fetches the correct pre-built wheels from `data.pyg.org`:
+>
+> ```powershell
+> python install_pyg_deps.py
+> ```
+
+Alternatively, run the equivalent pip command manually.
+Find your versions with `python -c "import torch; print(torch.__version__, torch.version.cuda)"`:
+
+| Setup | Command |
+|-------|---------|
+| PyTorch 2.2.x — CPU | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cpu.html` |
+| PyTorch 2.2.x — CUDA 12.1 | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html` |
+| PyTorch 2.2.x — CUDA 11.8 | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cu118.html` |
+| PyTorch 2.3.x — CPU | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.3.0+cpu.html` |
+
+> **Note:** these C++ wheels are optional speed-ups. `torch-geometric >= 2.4`
+> includes pure-Python fallbacks, so training will still run without them.
 
 ### 2. Run the data pipeline (if processed files are absent)
 ```bash
