@@ -102,8 +102,15 @@ def _nearest_node(G: nx.Graph, lat: float, lon: float):
 
 def _path_length(G: nx.Graph, src, tgt) -> float:
     """Shortest weighted path length (metres); falls back to haversine."""
+    # GraphML deserialises all attributes as strings, so cast length to float.
+    def _weight(u, v, d):
+        try:
+            return float(d.get("length", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
     try:
-        return nx.shortest_path_length(G, src, tgt, weight="length")
+        return nx.shortest_path_length(G, src, tgt, weight=_weight)
     except (nx.NetworkXNoPath, nx.NodeNotFound, nx.exception.NetworkXError):
         sd, td = G.nodes[src], G.nodes[tgt]
         return _haversine_m(
