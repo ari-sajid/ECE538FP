@@ -36,10 +36,6 @@ def main():
     hist = pd.read_csv(HIST_CSV)
     epochs = hist["epoch"].values
 
-    # Compute total loss as sum of the three objectives
-    hist["train_total"] = hist["train_F1"] + hist["train_F2"] + hist["train_F3"]
-    hist["test_total"]  = hist["test_F1"]  + hist["test_F2"]  + hist["test_F3"]
-
     fig, axes = plt.subplots(2, 3, figsize=(18, 10), facecolor="#f8f9fa")
     fig.suptitle(
         "GNN Training Metrics — ECE538FP\n"
@@ -47,14 +43,26 @@ def main():
         fontsize=13, fontweight="bold", y=1.01, color="#1a1a2e"
     )
 
+    # All three objectives on one panel for direct comparison
+    ax_all = axes[0, 0]
+    ax_all.plot(epochs, hist["train_F1"], color="#d62728", linewidth=2, label="Train F1")
+    ax_all.plot(epochs, hist["test_F1"],  color="#d62728", linewidth=2, linestyle="--", alpha=0.7, label="Test F1")
+    ax_all.plot(epochs, hist["train_F2"], color="#2ca02c", linewidth=2, label="Train F2")
+    ax_all.plot(epochs, hist["test_F2"],  color="#2ca02c", linewidth=2, linestyle="--", alpha=0.7, label="Test F2")
+    ax_all.set_title("F1 & F2 Objectives Over Training\n(F3 on separate scale — see D)", fontweight="bold", fontsize=10)
+    ax_all.set_xlabel("Epoch", fontsize=9)
+    ax_all.set_ylabel("Loss", fontsize=9)
+    ax_all.legend(fontsize=8)
+    ax_all.grid(True, alpha=0.3, linewidth=0.5)
+    ax_all.tick_params(labelsize=8)
+
     plot_cfg = [
-        ("train_total", "test_total", "Total Loss (F1+F2+F3)", "#1f77b4"),
-        ("train_F1",    "test_F1",    "F1 – Gate Constraint Loss",    "#d62728"),
-        ("train_F2",    "test_F2",    "F2 – Taxiing Distance Loss",   "#2ca02c"),
-        ("train_F3",    "test_F3",    "F3 – Schedule Stability Loss", "#ff7f0e"),
+        ("train_F1", "test_F1", "F1 – Gate Constraint Loss",    "#d62728"),
+        ("train_F2", "test_F2", "F2 – Taxiing Distance Loss",   "#2ca02c"),
+        ("train_F3", "test_F3", "F3 – Schedule Stability Loss", "#ff7f0e"),
     ]
 
-    for ax, (tr_col, te_col, title, colour) in zip(axes.flat[:4], plot_cfg):
+    for ax, (tr_col, te_col, title, colour) in zip(axes.flat[1:4], plot_cfg):
         ax.plot(epochs, hist[tr_col], color=colour, linewidth=2, label="Train", zorder=3)
         ax.plot(epochs, hist[te_col], color=colour, linewidth=2, linestyle="--",
                 alpha=0.7, label="Test", zorder=3)
@@ -98,11 +106,12 @@ def main():
 
     # Panel F: Train/Test gap over epochs
     ax_gap = axes[1, 2]
-    gap = hist["test_total"] - hist["train_total"]
+    # Use F3 for the gap since it's the dominant and most volatile objective
+    gap = hist["test_F3"] - hist["train_F3"]
     colours = ["#d62728" if g > 0 else "#2ca02c" for g in gap]
     ax_gap.bar(epochs, gap, color=colours, alpha=0.75, width=0.8)
     ax_gap.axhline(0, color="black", linewidth=0.8)
-    ax_gap.set_title("Generalisation Gap\n(Test − Train total loss)",
+    ax_gap.set_title("Generalisation Gap on F3\n(Test − Train delay loss)",
                      fontweight="bold", fontsize=10)
     ax_gap.set_xlabel("Epoch", fontsize=9)
     ax_gap.set_ylabel("Gap", fontsize=9)
