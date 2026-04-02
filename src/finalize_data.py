@@ -1,10 +1,13 @@
 import pandas as pd
 import numpy as np
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # 1. Load Data
 print("Loading flight and weather data...")
-flights = pd.read_csv('data/raw/nyc_master_2025.csv')
-weather = pd.read_csv('data/processed/weather_clean_2025.csv')
+flights = pd.read_csv(ROOT / 'data' / 'raw' / 'nyc_master_2025.csv')
+weather = pd.read_csv(ROOT / 'data' / 'processed' / 'weather_clean_2025.csv')
 
 # 2. Prepare Timestamps for Merging
 # We round flight times to the nearest hour to match the weather observations
@@ -36,5 +39,5 @@ df = pd.get_dummies(df, columns=['OP_UNIQUE_CARRIER', 'ORIGIN'])
 cols_to_drop = ['hour_group', 'valid', 'station', 'DEST', 'TAIL_NUM']
 final_df = df.drop(columns=cols_to_drop)
 
-final_df.to_csv('data/processed/final_node_features.csv', index=False)
+final_df.to_csv(ROOT / 'data' / 'processed' / 'final_node_features.csv', index=False)
 print(f"Success! Final Node Matrix saved with {final_df.shape[1]} features.")

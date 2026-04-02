@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 def process_weather(file_path, station_name):
     print(f"Cleaning weather for {station_name}...")
@@ -43,12 +46,12 @@ def process_weather(file_path, station_name):
     return df
 
 # Ensure output directory exists
-os.makedirs('data/processed/', exist_ok=True)
+(ROOT / 'data' / 'processed').mkdir(parents=True, exist_ok=True)
 
 # Process both airports and combine into a single file
-ewr_clean = process_weather('data/meta/weather_ewr.csv', 'EWR')
-lga_clean = process_weather('data/meta/weather_lga.csv', 'LGA')
+ewr_clean = process_weather(ROOT / 'data' / 'meta' / 'weather_ewr.csv', 'EWR')
+lga_clean = process_weather(ROOT / 'data' / 'meta' / 'weather_lga.csv', 'LGA')
 
 weather_master = pd.concat([ewr_clean, lga_clean])
-weather_master.to_csv('data/processed/weather_clean_2025.csv', index=False)
+weather_master.to_csv(ROOT / 'data' / 'processed' / 'weather_clean_2025.csv', index=False)
 print("Success! Processed weather saved to data/processed/weather_clean_2025.csv")
