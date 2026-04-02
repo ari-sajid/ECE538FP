@@ -16,6 +16,19 @@ PyG's NeighborLoader is used so that only small subgraphs (seed nodes +
 sampled 2-hop neighbourhoods) are materialised per mini-batch, keeping
 peak RAM well below the full-graph size.
 
+Temporal batching (Step 5)
+--------------------------
+Training seed nodes are sorted into (month, time-window) buckets before
+being fed to NeighborLoader.  Each mini-batch therefore contains flights
+from the same departure window so the model sees complete intra-day
+congestion clusters together rather than random cross-day mixes.
+Use --window_hours to control bucket width (default 4 h).
+
+Attention heads (Step 6)
+------------------------
+The model uses GATConv; --num_heads controls how many attention heads are
+used per layer (default 4).  hidden_channels must be divisible by num_heads.
+
 Pareto front
 ------------
 After training, the three test-set objective values (F1, F2, F3) recorded
@@ -64,6 +77,7 @@ LGA_GML  = DATA_DIR / "geo"       / "lga_layout.graphml"
 DEFAULTS = dict(
     hidden_channels  = 128,
     num_layers       = 3,
+    num_heads        = 4,    # GAT attention heads (Step 6)
     dropout          = 0.3,
     lr               = 1e-3,
     weight_decay     = 1e-4,
@@ -71,12 +85,48 @@ DEFAULTS = dict(
     batch_size       = 512,
     num_neighbors_l1 = 10,   # neighbours sampled at hop 1
     num_neighbors_l2 = 5,    # neighbours sampled at hop 2
+    window_hours     = 4,    # temporal batch window width in hours (Step 5)
     alpha            = 1.0,  # F1 weight
     beta             = 1.0,  # F2 weight
     gamma            = 1.0,  # F3 weight
     lam              = 1.0,  # auxiliary delay-regression weight
     device           = "cuda" if torch.cuda.is_available() else "cpu",
 )
+
+
+# ---------------------------------------------------------------------------
+# Temporal batch ordering (Step 5)
+# ---------------------------------------------------------------------------
+
+def temporal_sort_ids(
+    node_ids: torch.Tensor,
+    crs_dep_times: np.ndarray,
+    fl_months: np.ndarray,
+    window_hours: int = 4,
+) -> torch.Tensor:
+    """
+    Return node_ids sorted by (month, departure-time window) so that each
+    NeighborLoader mini-batch contains flights from the same time window.
+
+    Parameters
+    ----------
+    node_ids      : 1-D LongTensor of global node indices
+    crs_dep_times : ndarray[int] of shape (N_total,) – CRS_DEP_TIME (HHMM)
+    fl_months     : ndarray[int] of shape (N_total,) – FL_DATE month (1-12)
+    window_hours  : width of each time bucket in hours (default 4)
+
+    Returns
+    -------
+    LongTensor of the same length as node_ids, sorted temporally.
+    """
+    ids_np   = node_ids.numpy()
+    hours    = (crs_dep_times[ids_np] // 100).astype(np.int32)
+    windows  = (hours // window_hours).astype(np.int32)
+    months   = fl_months[ids_np].astype(np.int32)
+    # Composite sort key: month takes precedence, then intra-day window
+    sort_key = months * 1000 + windows
+    order    = np.argsort(sort_key, kind="stable")
+    return torch.from_numpy(ids_np[order])
 
 
 # ---------------------------------------------------------------------------
@@ -146,26 +196,26 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     carrier_cols = sorted(c for c in df.columns if c.startswith("OP_UNIQUE_CARRIER_"))
     origin_cols  = sorted(c for c in df.columns if c.startswith("ORIGIN_"))
     carrier_list = [c.replace("OP_UNIQUE_CARRIER_", "") for c in carrier_cols]
+    origin_list  = [c.replace("ORIGIN_", "") for c in origin_cols]
 
     # Departure delay: supervised regression target, clipped to [-60, 300] min
     delay_raw = pd.to_numeric(df["DEP_DELAY"], errors="coerce").fillna(0.0)
     delay = delay_raw.clip(-60, 300).values.astype(np.float32)
 
-    # ── Airport assignment ──────────────────────────────────────────────────
-    # For departing flights:  ORIGIN = EWR or LGA  (present in OHE columns)
-    # For arriving flights:   DEST = EWR or LGA    (DEST was dropped from node
-    #                         features, so we reload DEST from the raw CSV)
-    dep_ewr = df.get("ORIGIN_EWR", pd.Series(0, index=df.index)).astype(float).values
-    dep_lga = df.get("ORIGIN_LGA", pd.Series(0, index=df.index)).astype(float).values
-
-    print(f"Loading DEST column from raw CSV to recover arriving-flight airports…")
-    raw_dest = pd.read_csv(raw_csv, usecols=["DEST"], low_memory=False)["DEST"]
-    arr_ewr = (raw_dest == "EWR").astype(float).values
-    arr_lga = (raw_dest == "LGA").astype(float).values
-
-    is_ewr    = np.clip(dep_ewr + arr_ewr, 0, 1).astype(np.float32)
-    is_lga    = np.clip(dep_lga + arr_lga, 0, 1).astype(np.float32)
-    is_at_nyc = np.clip(is_ewr + is_lga,  0, 1).astype(np.float32)
+    # ── Airport assignment (Step 3) ─────────────────────────────────────────
+    # AT_EWR and AT_LGA are now pre-computed by finalize_data.py and stored
+    # directly in the node feature matrix — no raw CSV reload needed.
+    if "AT_EWR" in df.columns and "AT_LGA" in df.columns:
+        is_ewr    = df["AT_EWR"].astype(np.float32).values
+        is_lga    = df["AT_LGA"].astype(np.float32).values
+        is_at_nyc = np.clip(is_ewr + is_lga, 0, 1).astype(np.float32)
+        print("  Airport flags     : AT_EWR / AT_LGA loaded from node features.")
+    else:
+        # Fallback for node feature files generated before Step 3
+        print("  AT_EWR/AT_LGA not found — falling back to ORIGIN OHE columns.")
+        is_ewr = df.get("ORIGIN_EWR", pd.Series(0, index=df.index)).astype(float).values
+        is_lga = df.get("ORIGIN_LGA", pd.Series(0, index=df.index)).astype(float).values
+        is_at_nyc = np.clip(is_ewr + is_lga, 0, 1).astype(np.float32)
 
     # ── Feature matrix ──────────────────────────────────────────────────────
     # Drop non-numeric / metadata columns; DEP_DELAY used separately above.
@@ -180,6 +230,12 @@ def load_node_features(node_csv: Path, raw_csv: Path):
 
     carrier_ohe = df[carrier_cols].astype(np.float32).values    # [N, C]
 
+    # CRS_DEP_TIME and FL_DATE month — used by temporal batch sorter
+    crs_dep_times = pd.to_numeric(
+        df.get("CRS_DEP_TIME", pd.Series(0, index=df.index)), errors="coerce"
+    ).fillna(0).values.astype(np.int32)
+    fl_months = fl_date.dt.month.values.astype(np.int32)
+
     print(f"  Feature dimension : {x.shape[1]}")
     print(f"  Carriers tracked  : {len(carrier_list)} ({', '.join(carrier_list[:8])}…)")
 
@@ -192,6 +248,10 @@ def load_node_features(node_csv: Path, raw_csv: Path):
         torch.from_numpy(train_mask),
         torch.from_numpy(test_mask),
         carrier_list,
+        origin_list,
+        feature_cols,
+        crs_dep_times,
+        fl_months,
     )
 
 
@@ -363,7 +423,8 @@ def main():
 
     # ── Load processed data ──────────────────────────────────────────────
     (x, delay, carrier_ohe, is_lga, is_at_nyc,
-     train_mask, test_mask, carrier_list) = load_node_features(NODE_CSV, RAW_CSV)
+     train_mask, test_mask, carrier_list, origin_list,
+     feature_cols, crs_dep_times, fl_months) = load_node_features(NODE_CSV, RAW_CSV)
 
     turnaround_ei, congestion_ei = load_edges(EDGE_CSV)
     data = build_hetero_data(x, delay, turnaround_ei, congestion_ei)
@@ -375,6 +436,17 @@ def main():
     print(f"\nGraph  : {N:,} nodes | F_in={F_in}")
     print(f"Train  : {len(train_ids):,} seed nodes")
     print(f"Test   : {len(test_ids):,} seed nodes\n")
+
+    # ── Temporal sort for training (Step 5) ──────────────────────────────
+    # Sort train seed nodes by (month, departure-time window) so each
+    # mini-batch processes flights from the same congestion window together.
+    print(f"Sorting train nodes into {args.window_hours}-hour temporal windows…")
+    train_ids_sorted = temporal_sort_ids(
+        train_ids, crs_dep_times, fl_months, args.window_hours
+    )
+    print(f"  Done.  First batch window: "
+          f"month={fl_months[train_ids_sorted[0].item()]} "
+          f"dep={crs_dep_times[train_ids_sorted[0].item()]:04d}\n")
 
     # ── Build NeighborLoaders ─────────────────────────────────────────────
     num_nbrs = [args.num_neighbors_l1, args.num_neighbors_l2]
@@ -389,24 +461,27 @@ def main():
         num_workers    = 2,
         persistent_workers = True,
     )
+    # Training: temporally ordered (shuffle=False preserves window grouping)
     train_loader = NeighborLoader(
-        input_nodes=("flight", train_ids),
-        shuffle=True,
+        input_nodes=("flight", train_ids_sorted),
+        shuffle=False,
         **shared_loader_kwargs,
     )
+    # Test: original order is fine (evaluation only)
     test_loader = NeighborLoader(
         input_nodes=("flight", test_ids),
         shuffle=False,
         **shared_loader_kwargs,
     )
 
-    # ── Model ────────────────────────────────────────────────────────────
+    # ── Model (Step 6: GATConv with num_heads) ────────────────────────────
     model = SpatioTemporalGNN(
         in_channels     = F_in,
         hidden_channels = args.hidden_channels,
         num_gates       = NUM_GATES,
         num_layers      = args.num_layers,
         dropout         = args.dropout,
+        num_heads       = args.num_heads,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -465,10 +540,25 @@ def main():
                     "model_state"  : model.state_dict(),
                     "in_channels"  : F_in,
                     "carrier_list" : carrier_list,
+                    "origin_list"  : origin_list,
+                    "feature_cols" : feature_cols,
                     "args"         : vars(args),
                 },
                 OUT_DIR / "best_model.pt",
             )
+            # Also save a human-readable feature schema for the inference API
+            import json as _json
+            schema = {
+                "in_channels"  : F_in,
+                "carrier_list" : carrier_list,
+                "origin_list"  : origin_list,
+                "feature_cols" : feature_cols,
+                "num_heads"    : args.num_heads,
+                "hidden_channels": args.hidden_channels,
+                "num_layers"   : args.num_layers,
+            }
+            with open(OUT_DIR / "feature_schema.json", "w") as _fh:
+                _json.dump(schema, _fh, indent=2)
 
     # ── Pareto front analysis (on test objectives) ────────────────────────
     test_pts = [(r[4], r[5], r[6]) for r in history]   # (F1, F2, F3) at test

@@ -37,5 +37,9 @@ scipy>=1.11.0           # Kendall-Tau distance in safe_override.py
 # ── Visualisation ───────────────────────────────────────────────────────────
 matplotlib>=3.7.0
 
+# ── Inference API (Step 7) ──────────────────────────────────────────────────
+fastapi>=0.110.0        # web framework for /predict endpoint
+uvicorn>=0.29.0         # ASGI server  (run with: uvicorn src.api:app --reload)
+
 # ── Utilities ───────────────────────────────────────────────────────────────
 tqdm>=4.65.0

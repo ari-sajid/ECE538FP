@@ -26,15 +26,25 @@ df = pd.merge(
     how='left'
 )
 
-# 4. Encode Categorical Features
+# 4. Add NYC-side airport flags (Step 3: arrival-gate assignments)
+# Before DEST is dropped, derive two binary features so arriving flights
+# carry their NYC airport identity directly in the feature matrix.
+# This removes the need to reload the raw CSV during training.
+print("Adding AT_EWR / AT_LGA airport flags...")
+df['AT_EWR'] = ((df['ORIGIN'] == 'EWR') | (df['DEST'] == 'EWR')).astype(np.uint8)
+df['AT_LGA'] = ((df['ORIGIN'] == 'LGA') | (df['DEST'] == 'LGA')).astype(np.uint8)
+
+# 5. Encode Categorical Features
 print("Encoding airlines and airports...")
 # Convert Airline and Origin into numeric codes for the GNN
 df = pd.get_dummies(df, columns=['OP_UNIQUE_CARRIER', 'ORIGIN'])
 
-# 5. Final Cleanup
+# 6. Final Cleanup
 # Drop intermediate columns and save the "Gold" dataset
 cols_to_drop = ['hour_group', 'valid', 'station', 'DEST', 'TAIL_NUM']
 final_df = df.drop(columns=cols_to_drop)
 
 final_df.to_csv('data/processed/final_node_features.csv', index=False)
 print(f"Success! Final Node Matrix saved with {final_df.shape[1]} features.")
+print(f"  AT_EWR flights : {final_df['AT_EWR'].sum():,}")
+print(f"  AT_LGA flights : {final_df['AT_LGA'].sum():,}")
