@@ -232,8 +232,14 @@ class TaxiingDistanceLoss(nn.Module):
         super().__init__()
         print("Loading EWR airport network graph…")
         G_ewr = nx.read_graphml(str(ewr_graphml))
+        for _, _, d in G_ewr.edges(data=True):
+            if "length" in d:
+                d["length"] = float(d["length"])
         print("Loading LGA airport network graph…")
         G_lga = nx.read_graphml(str(lga_graphml))
+        for _, _, d in G_lga.edges(data=True):
+            if "length" in d:
+                d["length"] = float(d["length"])
 
         dist_vec = self._build_distance_vector(G_ewr, G_lga)
         self.register_buffer("dist_vec", dist_vec)  # [NUM_GATES]
