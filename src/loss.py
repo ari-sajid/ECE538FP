@@ -190,26 +190,54 @@ class GateConstraintLoss(nn.Module):
         self.register_buffer("invalid", invalid)   # [C, 2, G]
         self.carrier_list = carrier_list
 
+    def _per_flight_invalid_mask(
+        self,
+        carrier_ohe: torch.Tensor,  # [N, C]
+        is_lga: torch.Tensor,       # [N]
+    ) -> torch.Tensor:              # [N, G]  float, 1 = infeasible
+        """Compute per-flight infeasibility mask (shared by forward and mask_logits)."""
+        per_flight_inv = torch.einsum("nc,cag->nag", carrier_ohe.float(),
+                                      self.invalid)
+        ap_idx     = is_lga.long().clamp(0, 1)
+        ap_idx_exp = ap_idx.view(-1, 1, 1).expand(-1, 1, NUM_GATES)
+        return per_flight_inv.gather(1, ap_idx_exp).squeeze(1)   # [N, G]
+
+    def mask_logits(
+        self,
+        gate_logits: torch.Tensor,  # [N, G]
+        carrier_ohe: torch.Tensor,  # [N, C]
+        is_lga: torch.Tensor,       # [N]
+    ) -> torch.Tensor:              # [N, G]
+        """
+        Set logits of infeasible gates to -inf (hard constraint).
+
+        Using torch.where keeps the operation differentiable: gradients for
+        masked positions are zero (they never influence any softmax output),
+        while gradients for valid positions flow normally.
+
+        If a flight has NO valid gate in the mapping (edge case), all gates
+        are restored (fallback to soft penalty only) to avoid NaN in softmax.
+        """
+        inv_mask = self._per_flight_invalid_mask(carrier_ohe, is_lga)  # [N, G]
+        valid    = inv_mask < 0.5                                        # [N, G] bool
+
+        # Fallback: if every gate is masked, restore all (avoids softmax NaN)
+        has_valid = valid.any(dim=-1, keepdim=True)    # [N, 1]
+        valid     = valid | ~has_valid                  # allow all when nothing valid
+
+        neg_inf = torch.full_like(gate_logits, float("-inf"))
+        return torch.where(valid, gate_logits, neg_inf)
+
     def forward(
         self,
-        gate_logits: torch.Tensor,   # [N, G]
+        gate_logits: torch.Tensor,   # [N, G]  — pass PRE-MASKED logits for zero penalty
         carrier_ohe: torch.Tensor,   # [N, C]  (float one-hot)
         is_lga: torch.Tensor,        # [N]     (float: 1 = LGA, 0 = EWR)
     ) -> torch.Tensor:
         """Returns mean infeasibility probability (scalar)."""
         gate_probs = torch.softmax(gate_logits, dim=-1)   # [N, G]
-
-        # Per-flight invalid mask: einsum carrier_ohe [N,C] × invalid [C,2,G]
-        # → [N, 2, G]
-        per_flight_inv = torch.einsum("nc,cag->nag", carrier_ohe.float(),
-                                      self.invalid)
-
-        # Select the airport dimension (0=EWR, 1=LGA) per flight
-        ap_idx = is_lga.long().clamp(0, 1)                        # [N]
-        ap_idx_exp = ap_idx.view(-1, 1, 1).expand(-1, 1, NUM_GATES)
-        inv_mask = per_flight_inv.gather(1, ap_idx_exp).squeeze(1)  # [N, G]
-
-        penalty = (gate_probs * inv_mask).sum(dim=-1)  # [N]
+        inv_mask   = self._per_flight_invalid_mask(carrier_ohe, is_lga)
+        penalty    = (gate_probs * inv_mask).sum(dim=-1)  # [N]
         return penalty.mean()
 
 
@@ -335,7 +363,9 @@ class EntropyRegularization(nn.Module):
     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
         log_probs = torch.log_softmax(gate_logits, dim=-1)  # numerically stable
         probs     = torch.softmax(gate_logits, dim=-1)
-        entropy   = -(probs * log_probs).sum(dim=-1).mean()
+        # nan_to_num handles 0 * (-inf) = NaN that arises when hard-masked gates
+        # have prob=0 and log_prob=-inf; the mathematical limit x·log(x)→0 as x→0.
+        entropy   = -(probs * log_probs).nan_to_num(0.0).sum(dim=-1).mean()
         return -entropy   # minimise → maximise confidence
 
 
@@ -401,7 +431,7 @@ class MultiObjectiveLoss(nn.Module):
         ewr_graphml: str,
         lga_graphml: str,
         carrier_list: List[str],
-        alpha: float = 2.0,
+        alpha: float = 5.0,   # F1 dominance — hard masking makes this mostly symbolic
         beta: float = 1.0,
         gamma: float = 1.0,
         lam: float = 0.1,
@@ -439,18 +469,27 @@ class MultiObjectiveLoss(nn.Module):
         f2     : scalar – expected taxi dist  [0,1]  (Pareto logging)
         f3     : scalar – mean positive delay in raw minutes (Pareto logging)
         """
-        loss_f1  = self.f1(gate_logits, carrier_ohe, is_lga)
-        loss_f2  = self.f2(gate_logits, is_at_nyc)
-        # Scaled versions used only for gradient computation
+        # ── Hard gate feasibility enforcement ──────────────────────────────
+        # Set infeasible gate logits to -inf BEFORE any softmax operation.
+        # This guarantees zero probability mass on invalid gates in every
+        # downstream computation (F1, F2, entropy) — zero gate violations
+        # by construction, at both training and inference time.
+        masked_logits = self.f1.mask_logits(gate_logits, carrier_ohe, is_lga)
+
+        # All gate-related losses use the hard-masked logits
+        loss_f1    = self.f1(masked_logits, carrier_ohe, is_lga)   # = 0.0 always
+        loss_f2    = self.f2(masked_logits, is_at_nyc)
+        loss_ent   = self.entropy(masked_logits)
+
+        # Delay-related losses are independent of the gate mask
         loss_f3_s  = self.f3(delay_pred, self.delay_scale)
         loss_reg_s = self.l_reg(delay_pred, delay_true, self.delay_scale)
-        loss_ent   = self.entropy(gate_logits)
 
         total = (
-            self.alpha          * loss_f1
-            + self.beta         * loss_f2
-            + self.gamma        * loss_f3_s
-            + self.lam          * loss_reg_s
+            self.alpha            * loss_f1
+            + self.beta           * loss_f2
+            + self.gamma          * loss_f3_s
+            + self.lam            * loss_reg_s
             + self.entropy_weight * loss_ent
         )
 

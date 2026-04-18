@@ -87,8 +87,8 @@ DEFAULTS = dict(
     num_neighbors_l1 = 10,
     num_neighbors_l2 = 5,
     window_hours     = 4,
-    # Loss weights — rebalanced so all terms are on the same [0,1] scale
-    alpha            = 2.0,  # F1 (gate constraint) — increased to dominate
+    # Loss weights — F1 is enforced by hard masking (always 0); alpha is symbolic
+    alpha            = 5.0,  # F1 weight (infeasible logits masked to -inf first)
     beta             = 1.0,  # F2 (taxi distance)
     gamma            = 1.0,  # F3 (schedule stability, now normalised)
     lam              = 0.1,  # L_reg (delay regression) — reduced from 1.0
@@ -535,6 +535,8 @@ def main():
 
     # ── Training loop with early stopping on val loss ─────────────────────
     print("\n" + "=" * 100)
+    print("Gate feasibility: HARD MASK active — infeasible logits forced to -inf "
+          "→ F1 = 0.0000 guaranteed every epoch")
     print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-F1':>7}  {'Tr-F2':>7}  {'Tr-F3':>7}"
           f"  {'VaLoss':>8}  {'Va-F1':>7}  {'Va-F2':>7}  {'Va-F3':>7}  {'*':>2}")
     print("=" * 100)

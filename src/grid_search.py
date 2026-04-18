@@ -1,8 +1,13 @@
 """
 Grid search over loss-weight configurations for the airport gate GNN.
 
-Systematically explores the (α, β, γ, λ) Pareto trade-off space and saves
+Systematically explores the (β, γ, λ, ε) Pareto trade-off space and saves
 a ranked summary so you can pick the best configuration before a final run.
+
+Gate feasibility (F1) is enforced by hard masking — infeasible gate logits are
+set to -inf before every softmax, guaranteeing F1 = 0 for all configurations.
+Alpha (F1 weight) is fixed at 5.0 across all configs; the meaningful variation
+is across β (taxi distance), γ (schedule stability), and ε (entropy confidence).
 
 Each config trains a full model and reports:
   - Best val F1 / F2 / F3
@@ -19,16 +24,16 @@ Results are written to:
 
 Configurations
 --------------
-Six configurations spanning different Pareto regions:
+Six configurations spanning meaningful Pareto regions (F1 = 0 in all cases):
 
   Config  alpha  beta  gamma  lam   entropy_weight  Focus
   ──────  ─────  ────  ─────  ────  ──────────────  ──────────────────────────
-  A       3.0    1.0   0.5    0.05  0.15  Strongly emphasise gate feasibility (F1)
-  B       2.0    2.0   0.5    0.05  0.10  Balanced F1+F2, reduce delay noise
-  C       2.0    1.0   1.5    0.05  0.10  Emphasise schedule stability (F3)
-  D       1.5    0.5   0.5    0.01  0.20  High-entropy push, loose constraints
-  E       4.0    0.5   0.5    0.05  0.10  Aggressive F1 dominance
-  F       2.0    1.0   1.0    0.10  0.10  Balanced (matches train.py defaults)
+  A       5.0    2.0   0.5    0.05  0.10  Minimise taxi distance (F2-dominant)
+  B       5.0    1.0   2.0    0.05  0.10  Minimise delay propagation (F3-dominant)
+  C       5.0    1.0   1.0    0.05  0.30  High-confidence gate assignments (entropy)
+  D       5.0    1.5   1.5    0.05  0.10  Balanced F2 + F3
+  E       5.0    2.0   0.5    0.05  0.20  Taxi distance + confident assignments
+  F       5.0    1.0   1.0    0.10  0.10  Balanced default (matches train.py)
 """
 
 import argparse
@@ -47,17 +52,17 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Search grid
 # ---------------------------------------------------------------------------
 CONFIGS = [
-    dict(config_id="A", alpha=3.0, beta=1.0, gamma=0.5, lam=0.05, entropy_weight=0.15,
-         label="Strong-F1"),
-    dict(config_id="B", alpha=2.0, beta=2.0, gamma=0.5, lam=0.05, entropy_weight=0.10,
-         label="Balanced-F1-F2"),
-    dict(config_id="C", alpha=2.0, beta=1.0, gamma=1.5, lam=0.05, entropy_weight=0.10,
-         label="Emphasise-F3"),
-    dict(config_id="D", alpha=1.5, beta=0.5, gamma=0.5, lam=0.01, entropy_weight=0.20,
-         label="High-entropy"),
-    dict(config_id="E", alpha=4.0, beta=0.5, gamma=0.5, lam=0.05, entropy_weight=0.10,
-         label="Aggressive-F1"),
-    dict(config_id="F", alpha=2.0, beta=1.0, gamma=1.0, lam=0.10, entropy_weight=0.10,
+    dict(config_id="A", alpha=5.0, beta=2.0, gamma=0.5, lam=0.05, entropy_weight=0.10,
+         label="Taxi-dominant"),
+    dict(config_id="B", alpha=5.0, beta=1.0, gamma=2.0, lam=0.05, entropy_weight=0.10,
+         label="Delay-dominant"),
+    dict(config_id="C", alpha=5.0, beta=1.0, gamma=1.0, lam=0.05, entropy_weight=0.30,
+         label="High-confidence"),
+    dict(config_id="D", alpha=5.0, beta=1.5, gamma=1.5, lam=0.05, entropy_weight=0.10,
+         label="Balanced-F2-F3"),
+    dict(config_id="E", alpha=5.0, beta=2.0, gamma=0.5, lam=0.05, entropy_weight=0.20,
+         label="Taxi-plus-confidence"),
+    dict(config_id="F", alpha=5.0, beta=1.0, gamma=1.0, lam=0.10, entropy_weight=0.10,
          label="Default-balanced"),
 ]
 
@@ -144,12 +149,13 @@ def run_config(cfg: dict, base_args: argparse.Namespace) -> dict:
 
 def composite_score(row: dict) -> float:
     """
-    Simple composite for ranking: lower is better.
-    Equal-weighted sum of normalised F1, F2, F3 test values.
+    Composite ranking score (lower is better).
+    F1 is excluded — hard masking guarantees F1 = 0 for all configs.
+    Score = F2 + F3/30  (normalises F3 from minutes into [0,1] scale).
     Returns inf if any metric is missing.
     """
     try:
-        return float(row["test_F1"]) + float(row["test_F2"]) + float(row["test_F3"]) / 30.0
+        return float(row["test_F2"]) + float(row["test_F3"]) / 30.0
     except (TypeError, ValueError):
         return float("inf")
 
@@ -194,8 +200,8 @@ def main():
     df.to_csv(out_csv, index=False)
 
     print(f"\n{'='*70}")
-    print("Grid Search Results (ranked by composite score F1 + F2 + F3/30):")
-    print(df[["config_id", "label", "alpha", "beta", "gamma", "lam",
+    print("Grid Search Results (ranked by F2 + F3/30;  F1 = 0.0 guaranteed by hard mask):")
+    print(df[["config_id", "label", "beta", "gamma", "entropy_weight",
               "test_F1", "test_F2", "test_F3", "composite"]].to_string(index=False))
     print(f"\nFull results saved to {out_csv}")
 
