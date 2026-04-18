@@ -20,6 +20,37 @@ OpenStreetMap airport-layout graphs.
 
 ---
 
+## System Overview
+
+The project implements a **three-tier scheduling pipeline**:
+
+```
+512k Flight Records
+        │
+        ▼
+┌───────────────────┐    π₀ ranking    ┌──────────────────────┐    proposals
+│  Tier 1           │ ───────────────► │  Tier 2              │ ──────────────►
+│  Greedy First-Fit │                  │  Spatio-Temporal GNN │
+│  Baseline (π₀)    │                  │  GATConv × 3 layers  │
+└───────────────────┘                  └──────────────────────┘
+                                                  │
+                                    Multi-objective loss
+                                    L = α·F1 + β·F2 + γ·F3
+                                                  │
+                                                  ▼
+                                    ┌──────────────────────────┐
+                                    │  Tier 3                  │
+                                    │  Safe Override (π*)      │
+                                    │  KT-guard + F1-feasibility│
+                                    └──────────────────────────┘
+                                                  │
+                                                  ▼
+                                         Final Assignment
+                                         + Delay Estimate
+```
+
+---
+
 ## Dataset
 
 | Source | File | Description |
@@ -33,8 +64,8 @@ OpenStreetMap airport-layout graphs.
 
 | File | Description |
 |------|-------------|
-| `data/processed/final_node_features.csv` | 512,061-row node feature matrix: numeric flight fields + one-hot carrier/origin + normalised weather |
-| `data/processed/edges.csv` | Graph edges: `turnaround` (same-aircraft chains) and `congestion` (same-airport 15-min window) |
+| `data/processed/final_node_features.csv` | 512,061-row, 141-column node feature matrix |
+| `data/processed/edges.csv` | Graph edges: turnaround + congestion |
 
 ---
 
@@ -42,8 +73,9 @@ OpenStreetMap airport-layout graphs.
 
 ```
 Nodes  :  one per flight record (~512 k)
-          features: scheduled time · carrier (OHE) · origin airport (OHE) ·
-                    distance · normalised wind · visibility · precipitation
+          141 features: scheduled time · carrier (OHE) · origin airport (OHE) ·
+                        distance · weather (wind/vis/precip) ·
+                        AT_EWR / AT_LGA binary flags
 
 Edges  :  turnaround  — flight[i] → flight[i+1] for the same aircraft tail number
                         (encodes downstream delay propagation)
@@ -52,23 +84,19 @@ Edges  :  turnaround  — flight[i] → flight[i+1] for the same aircraft tail n
                         (encodes runway/taxiway contention)
 ```
 
-Both edge types are handled by separate `SAGEConv` layers inside a PyG
-`HeteroConv` wrapper, so the model learns distinct message-passing weights for
-temporal and spatial relationships.
-
 ---
 
 ## Model Architecture (`src/model.py`)
 
 ```
-Input features  [N × F]
+Input features  [N × 141]
        │
   Linear projection + LayerNorm + ReLU
        │
   ┌────┴──────────────────────────────────────────┐
   │  HeteroConv  ×  num_layers  (default 3)        │
-  │   ├─ SAGEConv (turnaround edges, aggr=mean)    │
-  │   └─ SAGEConv (congestion  edges, aggr=mean)   │
+  │   ├─ GATConv (turnaround edges)  ← 4 heads    │
+  │   └─ GATConv (congestion  edges) ← 4 heads    │
   │   → sum both message streams per node          │
   │   → residual + LayerNorm + Dropout             │
   └────────────────────────────────────────────────┘
@@ -81,7 +109,14 @@ Input features  [N × F]
   └───────────────────┘
 ```
 
-Default hyper-parameters: `hidden=128`, `layers=3`, `dropout=0.3`.
+Default hyper-parameters: `hidden=128`, `layers=3`, `dropout=0.3`, `heads=4`.
+
+**Architecture notes:**
+- Uses `GATConv` (Graph Attention Network) — upgraded from SAGEConv — so the
+  model learns to weight neighbours differently (e.g. a late-running connecting
+  flight receives more attention than an on-time one).
+- `head_dim = hidden_channels // num_heads` ensures `concat=True` preserves
+  the hidden dimension across all residual connections.
 
 ---
 
@@ -94,31 +129,25 @@ L = α·F1 + β·F2 + γ·F3 + λ·L_reg
 ```
 
 ### F1 — Gate Constraint Loss
-Penalises the softmax probability mass placed on terminals that violate
-`gate_mapping.json` (e.g. assigning a Delta flight to EWR Terminal C, or any
-EWR flight to an LGA terminal).  Differentiable via the softmax output.
+Penalises softmax probability mass placed on terminals that violate
+`gate_mapping.json`.  Differentiable via the softmax output.
 
 ### F2 — Taxiing Distance Loss
-At initialisation, the shortest network path (metres) between each terminal's
-centroid and its airport's runway is computed once using **NetworkX Dijkstra** on
-the GraphML road graphs.  During training:
-
+Shortest network path (metres) between each terminal and its runway is
+pre-computed once at init via **NetworkX Dijkstra** on the GraphML road graphs.
+During training:
 ```
 E[dist] = softmax(gate_logits) · precomputed_distance_vector
 ```
-
-This expectation is differentiable, so gradients flow back into the gate head.
 
 ### F3 — Schedule Stability Loss
 ```
 F3 = mean( ReLU(delay_pred) )
 ```
-Encourages gate assignments that minimise positive predicted delays; early
-departures are not penalised.
+Encourages assignments that minimise positive predicted delays.
 
 ### L_reg — Auxiliary Delay Regression
-MSE between the delay head's output and the observed `DEP_DELAY`.  Keeps the
-delay head calibrated so F3 is a meaningful signal.
+MSE between the delay head and observed `DEP_DELAY` to keep F3 calibrated.
 
 ---
 
@@ -127,24 +156,133 @@ delay head calibrated so F3 is a meaningful signal.
 ### Data split
 | Split | Months | Flights |
 |-------|--------|---------|
-| Train | Jan – Oct 2025 (1-10) | ~430 k |
-| Test  | Nov – Dec 2025 (11-12) | ~82 k |
+| Train | Jan – Sep 2025 (1–9) | ~360 k |
+| Val   | Oct 2025 (10) | ~52 k |
+| Test  | Nov – Dec 2025 (11–12) | ~88 k |
 
-### Memory-efficient batching
-With 512 k nodes the full graph does not fit in a forward pass.
-[PyG `NeighborLoader`](https://pytorch-geometric.readthedocs.io/en/latest/modules/loader.html#torch_geometric.loader.NeighborLoader)
-samples 2-hop subgraphs around each mini-batch of seed nodes `[10, 5]`
-neighbours per hop), keeping peak RAM well under the full-graph footprint.
+### Key features
+- **NeighborLoader** with 2-hop sampling `[10, 5]` for memory-safe mini-batch
+  training on 512 k nodes.
+- **Temporal batching** — seeds sorted by (month, 4-hour window) so mini-batches
+  approximate real scheduling order.
+- **AT_EWR / AT_LGA flags** — binary features derived from both ORIGIN and DEST
+  so arriving flights carry their NYC airport identity without requiring the raw
+  CSV at inference time.
+- **Feature schema** saved alongside each checkpoint (`outputs/feature_schema.json`)
+  so the inference API can reconstruct the exact feature vector ordering.
 
-### Optimiser
-Adam with cosine-annealing LR schedule and gradient clipping (`max_norm=1.0`).
+### CLI flags
 
-### Outputs
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hidden_channels` | 128 | GNN hidden layer width |
+| `--num_layers` | 3 | Message-passing rounds |
+| `--num_heads` | 4 | GAT attention heads |
+| `--dropout` | 0.3 | Dropout probability |
+| `--lr` | 1e-3 | Initial learning rate |
+| `--epochs` | 50 | Training epochs |
+| `--batch_size` | 512 | Seed nodes per mini-batch |
+| `--window_hours` | 4 | Temporal window size for seed sorting |
+| `--alpha` | 1.0 | F1 (gate constraint) weight |
+| `--beta` | 1.0 | F2 (taxiing distance) weight |
+| `--gamma` | 1.0 | F3 (schedule stability) weight |
+| `--lam` | 1.0 | Auxiliary regression weight |
+
+---
+
+## Baseline Policy (`src/baseline.py`)
+
+**Greedy First-Fit (π₀)** — mimics current manual scheduling practice:
+
+1. Sort flights by `(FL_DATE, CRS_DEP_TIME)`.
+2. For each flight, assign the first valid terminal for its carrier from
+   `gate_mapping.json`.  Unmapped carriers (F9, G4, MQ, NK, OO, YX) fall back
+   to EWR-A or LGA-B depending on their airport.
+
+### Baseline metrics (full 2025 dataset)
+
+| Metric | Value |
+|--------|-------|
+| F1 gate violations | **0** (0.000%) |
+| F2 mean taxi distance | **764 m** |
+| F3 = mean ReLU(delay) | **20.92 min** |
+| Delay rate (> 15 min) | 23.1% of flights |
+| EWR Terminal C utilisation | **0%** (unused — GNN opportunity) |
+
+Terminal breakdown:
+
+| Terminal | Flights | Approx. distance |
+|----------|---------|-----------------|
+| EWR Terminal A | 234,329 | 810 m |
+| EWR Terminal B | 6,301 | 1,140 m |
+| EWR Terminal C | 0 | 1,350 m |
+| LGA Terminal B | 212,914 | 660 m |
+| LGA Terminal C | 58,517 | 920 m |
+
+---
+
+## Safe Override Policy (`src/safe_override.py`)
+
+**π\*** applies a two-stage safety guard on top of any GNN proposal:
+
+1. **F1 feasibility check** — rejects any flight whose proposed terminal is
+   not authorised for its carrier.
+2. **Kendall-Tau guard** — computes the global KT rank-distance between the
+   full GNN proposal set and the baseline ranking.  If `KT > k_max` (default
+   0.05) the entire batch reverts to baseline.
+
+### Pre-training validation (test split, n = 88,052 flights)
+
+| Stage | Count | % |
+|-------|-------|---|
+| Accepted (GNN proposal) | 0 | 0.0% |
+| Rejected — F1 violation | 39,592 | 45.0% |
+| Rejected — KT guard | 48,460 | 55.0% |
+
+With an untrained (random-weight) GNN, π* correctly reverts **all** assignments
+to the baseline, producing identical F1/F2/F3 metrics.  This confirms the safety
+mechanism: zero constraint violations are introduced and the system degrades
+gracefully until a trained checkpoint is available.
+
+---
+
+## Inference API (`src/api.py`)
+
+A FastAPI server wraps the trained model for real-time use.
+
+```bash
+uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 ```
-outputs/
-  best_model.pt          — checkpoint of the epoch with lowest test loss
-  training_history.csv   — per-epoch F1 / F2 / F3 for train and test
-  pareto_front.csv       — non-dominated (Pareto-optimal) epochs on test set
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Liveness check; reports model load status |
+| `/gates` | GET | Lists the five terminal classes + approx distances |
+| `/predict` | POST | Gate assignments for a batch of ≤ 500 flights |
+
+**Fallback behaviour**: if no checkpoint exists the server returns
+`"policy": "baseline"` using Greedy First-Fit.  Turnaround + congestion edges
+are built on-the-fly from the request batch.
+
+---
+
+## Poster Visualisations (`src/plot_poster.py`)
+
+Eight publication-quality panels are generated in `outputs/poster/` (300 DPI):
+
+| File | Content |
+|------|---------|
+| `01_pipeline.png` | Three-tier scheduling pipeline diagram |
+| `02_graph_schema.png` | Heterogeneous graph (turnaround + congestion) |
+| `03_terminal_distribution.png` | Baseline terminal utilisation (EWR-C unused) |
+| `04_delay_distribution.png` | Departure delay histogram; F3 marker |
+| `05_hourly_pattern.png` | Avg departures/hour — EWR vs LGA |
+| `06_safe_override.png` | π* decision breakdown (accepted / F1-reject / KT-reject) |
+| `07_metrics_summary.png` | F1 / F2 / F3 comparison — π₀ vs π* |
+| `08_constraint_matrix.png` | Carrier × terminal authorisation matrix |
+
+```bash
+python -m src.plot_poster    # regenerate all panels
 ```
 
 ---
@@ -154,22 +292,35 @@ outputs/
 ```
 ECE538FP/
 ├── data/
-│   ├── raw/            nyc_master_2025.csv
-│   ├── meta/           gate_mapping.json, weather_ewr/lga.csv
-│   ├── geo/            ewr_layout.graphml, lga_layout.graphml
-│   └── processed/      final_node_features.csv, edges.csv  (generated)
+│   ├── raw/              nyc_master_2025.csv
+│   ├── meta/             gate_mapping.json · weather_ewr/lga.csv
+│   ├── geo/              ewr_layout.graphml · lga_layout.graphml
+│   └── processed/        final_node_features.csv · edges.csv  (generated)
 ├── src/
-│   ├── model.py        SpatioTemporalGNN definition
-│   ├── loss.py         F1 / F2 / F3 / MultiObjectiveLoss
-│   ├── train.py        Training loop + Pareto logging
-│   ├── finalize_data.py   Feature engineering (node matrix)
-│   ├── graph_engine.py    Edge generation (turnaround + congestion)
-│   ├── clean_weather.py   Weather normalisation
-│   ├── preprocess.py      BTS zip → nyc_master_2025.csv
-│   └── get_geo.py         Download airport GraphML from OSM
-├── outputs/            Model checkpoints + results (generated)
+│   ├── model.py          SpatioTemporalGNN (GATConv, HeteroConv)
+│   ├── loss.py           F1 / F2 / F3 / MultiObjectiveLoss
+│   ├── train.py          Training loop, temporal batching, Pareto logging
+│   ├── baseline.py       Greedy First-Fit policy (π₀)
+│   ├── safe_override.py  KT-guard + F1-feasibility policy (π*)
+│   ├── api.py            FastAPI inference server (Step 7)
+│   ├── plot_poster.py    Research-poster visualization suite (8 panels)
+│   ├── finalize_data.py  Feature engineering (node matrix + AT_EWR/AT_LGA)
+│   ├── graph_engine.py   Edge generation (turnaround + congestion)
+│   ├── clean_weather.py  Weather normalisation
+│   ├── preprocess.py     BTS zip → nyc_master_2025.csv
+│   └── get_geo.py        Download airport GraphML from OSM
+├── outputs/
+│   ├── best_model.pt               (generated after training)
+│   ├── feature_schema.json         (generated after training)
+│   ├── training_history.csv        (generated after training)
+│   ├── pareto_front.csv            (generated after training)
+│   ├── baseline_assignments.csv    Greedy π₀ assignments (all flights)
+│   ├── policy_comparison.csv       π₀ vs π* metric table
+│   ├── safe_override_decisions.csv Per-flight π* decision log
+│   ├── gnn_visualization.png       6-panel EDA figure
+│   └── poster/                     8-panel research poster figures
 ├── requirements.txt
-├── install_pyg_deps.py  Auto-detects PyTorch version and installs C++ wheels
+├── install_pyg_deps.py   Auto-detects PyTorch version; installs C++ wheels
 └── README.md
 ```
 
@@ -179,35 +330,18 @@ ECE538FP/
 
 ### 1. Install dependencies
 
-**Step 1 — core packages** (works on all platforms):
 ```bash
 pip install -r requirements.txt
 ```
 
-**Step 2 — PyG C++ extension wheels** (must match your PyTorch version):
+**PyG C++ extension wheels** (optional speed-up; must match your PyTorch/CUDA):
 
-> **Windows users:** the C++ extensions cannot be built from source on Windows.
-> Use the helper script — it auto-detects your PyTorch version and CUDA flavour
-> and fetches the correct pre-built wheels from `data.pyg.org`:
->
-> ```powershell
-> python install_pyg_deps.py
-> ```
+```bash
+python install_pyg_deps.py   # auto-detects version and fetches correct wheels
+```
 
-Alternatively, run the equivalent pip command manually.
-Find your versions with `python -c "import torch; print(torch.__version__, torch.version.cuda)"`:
+### 2. Run the data pipeline
 
-| Setup | Command |
-|-------|---------|
-| PyTorch 2.2.x — CPU | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cpu.html` |
-| PyTorch 2.2.x — CUDA 12.1 | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cu121.html` |
-| PyTorch 2.2.x — CUDA 11.8 | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.0+cu118.html` |
-| PyTorch 2.3.x — CPU | `pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.3.0+cpu.html` |
-
-> **Note:** these C++ wheels are optional speed-ups. `torch-geometric >= 2.4`
-> includes pure-Python fallbacks, so training will still run without them.
-
-### 2. Run the data pipeline (if processed files are absent)
 ```bash
 python src/clean_weather.py      # normalise weather CSVs
 python src/finalize_data.py      # merge features → final_node_features.csv
@@ -215,90 +349,109 @@ python src/graph_engine.py       # build graph edges  → edges.csv
 ```
 
 ### 3. Train
+
 ```bash
 python -m src.train \
     --epochs 50 \
     --batch_size 512 \
+    --num_heads 4 \
+    --window_hours 4 \
     --hidden_channels 128 \
     --alpha 1.0 --beta 1.0 --gamma 1.0
 ```
 
-All CLI flags and their defaults:
+### 4. Evaluate policies
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--hidden_channels` | 128 | GNN hidden layer width |
-| `--num_layers` | 3 | Message-passing rounds |
-| `--dropout` | 0.3 | Dropout probability |
-| `--lr` | 1e-3 | Initial learning rate |
-| `--epochs` | 50 | Training epochs |
-| `--batch_size` | 512 | Seed nodes per mini-batch |
-| `--num_neighbors_l1` | 10 | Neighbours sampled at hop 1 |
-| `--num_neighbors_l2` | 5 | Neighbours sampled at hop 2 |
-| `--alpha` | 1.0 | F1 (gate constraint) weight |
-| `--beta` | 1.0 | F2 (taxiing distance) weight |
-| `--gamma` | 1.0 | F3 (schedule stability) weight |
-| `--lam` | 1.0 | Auxiliary regression weight |
+```bash
+python src/baseline.py                          # run π₀ on full dataset
+python src/safe_override.py --split test        # run π* on test split
+```
+
+### 5. Regenerate poster figures
+
+```bash
+python -m src.plot_poster
+```
+
+### 6. Start inference API
+
+```bash
+uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+```
 
 ---
 
 ## Current Results
 
-The data engineering pipeline is complete and validated:
+### Completed
 
-- **512,061 flight nodes** with merged weather features (wind speed, visibility,
-  precipitation) and one-hot encoded carrier/origin columns.
-- **Two edge types** generated: turnaround chains connecting same-aircraft
-  consecutive flights; congestion edges linking flights at EWR/LGA within a
-  15-minute departure window.
-- **Airport layout graphs** for both EWR (6.9 MB) and LGA (13 MB) downloaded
-  from OpenStreetMap and stored as GraphML.
-- **Taxiing distance table** pre-computed (one Dijkstra call per terminal at
-  init):
+| Task | Status |
+|------|--------|
+| Data engineering (141-feature node matrix) | ✅ Complete |
+| AT_EWR / AT_LGA arrival-gate flags | ✅ Complete |
+| GATConv model (upgraded from SAGEConv) | ✅ Complete |
+| Multi-objective loss (F1 + F2 + F3) | ✅ Complete |
+| Temporal mini-batch sorting | ✅ Complete |
+| Greedy First-Fit baseline (π₀) | ✅ Complete — F2=764 m, F3=20.92 min, 0 violations |
+| Kendall-Tau safe override (π*) | ✅ Complete — safety guard validated on 88k test flights |
+| FastAPI inference server | ✅ Complete — baseline fallback operational |
+| Research poster visualisations (8 panels) | ✅ Complete |
 
-  | Terminal | Airport | Approx. runway dist. |
-  |----------|---------|----------------------|
-  | Terminal A | EWR | ~800 m |
-  | Terminal B | EWR | ~1 100 m |
-  | Terminal C | EWR | ~1 400 m |
-  | Terminal B | LGA | ~650 m |
-  | Terminal C | LGA | ~900 m |
+### Training metrics
 
-  *(Distances computed on the OSM road network; actual taxiway distances may
-  differ slightly.)*
+Model training requires a GPU and has not yet been executed on this machine.
+Teammates are running the training pipeline.  The table below will be updated
+once `outputs/training_history.csv` and `outputs/pareto_front.csv` are available.
 
-Model training has not yet been executed on the full dataset.  Baseline results
-will be added here once the first training run completes.
+| Epoch | F1 (test) | F2 (test) | F3 (test) | Policy |
+|-------|-----------|-----------|-----------|--------|
+| — | — | — | — | pending training run |
 
 ---
 
-## Next Steps
+## Remaining Steps
 
-1. **Run baseline training** — Execute the training pipeline on the full dataset
-   and record epoch-level F1 / F2 / F3 curves and the Pareto front.
+The following items are needed to complete the project:
 
-2. **Hyperparameter search** — Grid-search `alpha / beta / gamma` weights to
-   explore different Pareto trade-off points between gate feasibility, taxiing
-   efficiency, and schedule stability.
+### High priority
 
-3. **Add arrival-gate assignments** — Currently, gate assignments for arriving
-   flights (ORIGIN ≠ EWR/LGA) rely on the `DEST` column loaded from the raw CSV.
-   Incorporating `DEST` directly into the node feature matrix would make the
-   model self-contained.
+1. **Run `graph_engine.py`** to generate `data/processed/edges.csv` — the GPU
+   machine should run this before training starts.  Without edges the graph is
+   disconnected and the GNN cannot propagate messages.
 
-4. **Incorporate actual gate data** — If real gate assignment records become
-   available (e.g. from airport ops data), supervised classification can replace
-   the unsupervised multi-objective approach for F1, providing a stronger
-   training signal.
+2. **Full training run** — execute on the GPU machine:
+   ```bash
+   python -m src.train --epochs 50 --batch_size 512 --num_heads 4 --window_hours 4
+   ```
+   Expected outputs: `best_model.pt`, `feature_schema.json`,
+   `training_history.csv`, `pareto_front.csv`.
 
-5. **Temporal batching** — Replace random NeighborLoader sampling with
-   time-window mini-batches so that the model explicitly learns intra-day
-   congestion patterns.
+3. **Policy comparison after training** — re-run π* with the trained checkpoint
+   to measure real GNN improvements over the baseline:
+   ```bash
+   python src/safe_override.py --checkpoint outputs/best_model.pt --k_max 0.05 --split test
+   ```
 
-6. **Attention-based aggregation** — Replace SAGEConv with `GATConv` (Graph
-   Attention Network) so the model can learn to weight neighbours differently
-   (e.g. a connecting flight that is already delayed deserves more attention than
-   an on-time one).
+4. **Update this README** with actual F1 / F2 / F3 epoch curves and the
+   Pareto-front table from the training run.
 
-7. **Inference API** — Wrap the trained model in a lightweight REST endpoint so
-   that it can produce real-time gate suggestions given a new flight schedule.
+### Medium priority
+
+5. **Hyperparameter sweep** — test at least three (α, β, γ) configurations to
+   explore Pareto trade-offs, e.g.:
+   - (2, 1, 1) — emphasise constraint satisfaction
+   - (1, 2, 1) — emphasise short taxi distances
+   - (1, 1, 2) — emphasise schedule stability
+
+6. **Training curve + Pareto scatter plot** — add a `src/plot_results.py` script
+   that reads `training_history.csv` and `pareto_front.csv` and produces
+   poster-ready figures (F1/F2/F3 vs epoch, 3-D Pareto scatter).
+
+### Lower priority
+
+7. **Ablation study** — compare GATConv vs the original SAGEConv architecture
+   to quantify the contribution of attention-based aggregation.
+
+8. **Supervised gate labels** — if real gate assignment records become available,
+   add a cross-entropy head on top of the GNN to provide a stronger F1 training
+   signal than the soft-penalty approach.
