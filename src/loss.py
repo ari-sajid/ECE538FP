@@ -306,8 +306,37 @@ class ScheduleStabilityLoss(nn.Module):
     only flights predicted to depart late contribute to the loss.
     """
 
-    def forward(self, delay_pred: torch.Tensor) -> torch.Tensor:
-        return F.relu(delay_pred).mean()
+    def forward(
+        self,
+        delay_pred: torch.Tensor,   # [N]
+        delay_scale: float = 30.0,  # normalise to ≈[0,1] before loss computation
+    ) -> torch.Tensor:
+        # Divide by delay_scale so F3 lives on the same [0,1] scale as F1/F2.
+        # The raw-minute value is still returned for Pareto logging (see below).
+        return F.relu(delay_pred / delay_scale).mean()
+
+
+# ---------------------------------------------------------------------------
+# Entropy regularisation — prevents gate-head mode collapse
+# ---------------------------------------------------------------------------
+
+class EntropyRegularization(nn.Module):
+    """
+    Negative-entropy penalty on the gate-assignment distribution.
+
+    A uniform distribution over 5 gates has maximum entropy (log5 ≈ 1.61).
+    Minimising –H pushes the model toward *confident*, peaked assignments,
+    counteracting the tendency of an under-trained gate head to stay near
+    the uniform fixed-point (which produces a flat F1 curve).
+
+    Loss = –mean_entropy(softmax(gate_logits))
+    """
+
+    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
+        log_probs = torch.log_softmax(gate_logits, dim=-1)  # numerically stable
+        probs     = torch.softmax(gate_logits, dim=-1)
+        entropy   = -(probs * log_probs).sum(dim=-1).mean()
+        return -entropy   # minimise → maximise confidence
 
 
 # ---------------------------------------------------------------------------
@@ -316,19 +345,22 @@ class ScheduleStabilityLoss(nn.Module):
 
 class DelayRegressionLoss(nn.Module):
     """
-    MSE between predicted and observed departure delay (minutes).
+    Huber loss between predicted and observed departure delay.
 
-    This is NOT part of the three-objective Pareto front; it is an auxiliary
-    supervised signal that keeps the delay head calibrated so that F3 is
-    a meaningful measure of schedule stability.
+    Switching from MSE to Huber (delta=1.0 on the normalised scale) makes
+    the regression robust to large outlier delays that would otherwise
+    produce enormous gradients and overwhelm F1/F2.
     """
 
     def forward(
         self,
-        delay_pred: torch.Tensor,  # [N]
-        delay_true: torch.Tensor,  # [N]
+        delay_pred: torch.Tensor,   # [N]
+        delay_true: torch.Tensor,   # [N]
+        delay_scale: float = 30.0,
     ) -> torch.Tensor:
-        return F.mse_loss(delay_pred, delay_true.float())
+        pred_s = delay_pred / delay_scale
+        true_s = delay_true.float() / delay_scale
+        return F.huber_loss(pred_s, true_s, delta=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -337,18 +369,30 @@ class DelayRegressionLoss(nn.Module):
 
 class MultiObjectiveLoss(nn.Module):
     """
-    L = α·F1 + β·F2 + γ·F3 + λ·L_reg
+    L = α·F1 + β·F2 + γ·F3_scaled + λ·L_reg_scaled + ε·(–H)
+
+    All terms are normalised to a comparable [0, 1] scale before weighting:
+    - F1   ∈ [0, 1]  (probability mass on invalid gates)
+    - F2   ∈ [0, 1]  (normalised taxi distance, already scaled in F2 layer)
+    - F3   = mean(ReLU(delay_pred / delay_scale))   ← key fix: divide by 30 min
+    - L_reg = Huber(delay_pred/scale, delay_true/scale)  ← key fix: dimensionless
+    - –H   = –mean_entropy(gate_probs)              ← discourages uniform output
+
+    The raw-minute F3 value is still returned for Pareto logging.
 
     Parameters
     ----------
     gate_mapping_path : str
     ewr_graphml, lga_graphml : str
     carrier_list : list[str]
-        Carrier codes in the same order as the OHE columns in the CSV.
     alpha, beta, gamma : float
         Pareto trade-off weights for F1, F2, F3.
     lam : float
-        Weight of the auxiliary delay regression loss L_reg.
+        Weight of the auxiliary delay regression loss (default 0.1, not 1.0).
+    delay_scale : float
+        Reference delay in minutes used to normalise F3 and L_reg (default 30).
+    entropy_weight : float
+        Weight of the entropy penalty –H (default 0.1).
     """
 
     def __init__(
@@ -357,21 +401,26 @@ class MultiObjectiveLoss(nn.Module):
         ewr_graphml: str,
         lga_graphml: str,
         carrier_list: List[str],
-        alpha: float = 1.0,
+        alpha: float = 2.0,
         beta: float = 1.0,
         gamma: float = 1.0,
-        lam: float = 1.0,
+        lam: float = 0.1,
+        delay_scale: float = 30.0,
+        entropy_weight: float = 0.1,
     ):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.lam = lam
+        self.alpha          = alpha
+        self.beta           = beta
+        self.gamma          = gamma
+        self.lam            = lam
+        self.delay_scale    = delay_scale
+        self.entropy_weight = entropy_weight
 
-        self.f1 = GateConstraintLoss(gate_mapping_path, carrier_list)
-        self.f2 = TaxiingDistanceLoss(ewr_graphml, lga_graphml)
-        self.f3 = ScheduleStabilityLoss()
-        self.l_reg = DelayRegressionLoss()
+        self.f1      = GateConstraintLoss(gate_mapping_path, carrier_list)
+        self.f2      = TaxiingDistanceLoss(ewr_graphml, lga_graphml)
+        self.f3      = ScheduleStabilityLoss()
+        self.l_reg   = DelayRegressionLoss()
+        self.entropy = EntropyRegularization()
 
     def forward(
         self,
@@ -385,20 +434,26 @@ class MultiObjectiveLoss(nn.Module):
         """
         Returns
         -------
-        total  : scalar – combined back-prop loss
-        f1     : scalar – gate infeasibility  (for Pareto logging)
-        f2     : scalar – expected taxi dist  (for Pareto logging)
-        f3     : scalar – mean positive delay (for Pareto logging)
+        total  : scalar – combined back-prop loss (all terms normalised)
+        f1     : scalar – gate infeasibility  [0,1]  (Pareto logging)
+        f2     : scalar – expected taxi dist  [0,1]  (Pareto logging)
+        f3     : scalar – mean positive delay in raw minutes (Pareto logging)
         """
-        loss_f1 = self.f1(gate_logits, carrier_ohe, is_lga)
-        loss_f2 = self.f2(gate_logits, is_at_nyc)
-        loss_f3 = self.f3(delay_pred)
-        loss_reg = self.l_reg(delay_pred, delay_true)
+        loss_f1  = self.f1(gate_logits, carrier_ohe, is_lga)
+        loss_f2  = self.f2(gate_logits, is_at_nyc)
+        # Scaled versions used only for gradient computation
+        loss_f3_s  = self.f3(delay_pred, self.delay_scale)
+        loss_reg_s = self.l_reg(delay_pred, delay_true, self.delay_scale)
+        loss_ent   = self.entropy(gate_logits)
 
         total = (
-            self.alpha * loss_f1
-            + self.beta  * loss_f2
-            + self.gamma * loss_f3
-            + self.lam   * loss_reg
+            self.alpha          * loss_f1
+            + self.beta         * loss_f2
+            + self.gamma        * loss_f3_s
+            + self.lam          * loss_reg_s
+            + self.entropy_weight * loss_ent
         )
-        return total, loss_f1, loss_f2, loss_f3
+
+        # Raw F3 in minutes for Pareto / history logging
+        f3_raw = F.relu(delay_pred).mean()
+        return total, loss_f1, loss_f2, f3_raw
