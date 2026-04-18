@@ -44,6 +44,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 
@@ -77,19 +78,23 @@ LGA_GML  = DATA_DIR / "geo"       / "lga_layout.graphml"
 DEFAULTS = dict(
     hidden_channels  = 128,
     num_layers       = 3,
-    num_heads        = 4,    # GAT attention heads (Step 6)
-    dropout          = 0.3,
-    lr               = 1e-3,
+    num_heads        = 4,    # GAT attention heads
+    dropout          = 0.2,  # reduced from 0.3 — was too aggressive
+    lr               = 5e-4, # reduced from 1e-3 for more stable convergence
     weight_decay     = 1e-4,
-    epochs           = 50,
+    epochs           = 100,
     batch_size       = 512,
-    num_neighbors_l1 = 10,   # neighbours sampled at hop 1
-    num_neighbors_l2 = 5,    # neighbours sampled at hop 2
-    window_hours     = 4,    # temporal batch window width in hours (Step 5)
-    alpha            = 1.0,  # F1 weight
-    beta             = 1.0,  # F2 weight
-    gamma            = 1.0,  # F3 weight
-    lam              = 1.0,  # auxiliary delay-regression weight
+    num_neighbors_l1 = 10,
+    num_neighbors_l2 = 5,
+    window_hours     = 4,
+    # Loss weights — rebalanced so all terms are on the same [0,1] scale
+    alpha            = 2.0,  # F1 (gate constraint) — increased to dominate
+    beta             = 1.0,  # F2 (taxi distance)
+    gamma            = 1.0,  # F3 (schedule stability, now normalised)
+    lam              = 0.1,  # L_reg (delay regression) — reduced from 1.0
+    delay_scale      = 30.0, # divide delay by this to normalise F3 / L_reg
+    entropy_weight   = 0.1,  # –H entropy penalty (prevents uniform gate head)
+    patience         = 15,   # early-stopping patience (val epochs without improvement)
     device           = "cuda" if torch.cuda.is_available() else "cpu",
 )
 
@@ -171,25 +176,33 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     """
     Load final_node_features.csv and return tensors needed for training.
 
+    Split: months 1-8 → train, months 9-10 → val, months 11-12 → test.
+    Features are standardised (zero mean, unit variance) using statistics
+    computed on the training split only (no leakage into val/test).
+
     Returns
     -------
-    x            : FloatTensor [N, F]   – node feature matrix
+    x            : FloatTensor [N, F]   – standardised node feature matrix
     delay        : FloatTensor [N]      – observed departure delay (minutes)
-    carrier_ohe  : FloatTensor [N, C]   – one-hot carrier vectors
+    carrier_ohe  : FloatTensor [N, C]   – one-hot carrier vectors (unscaled)
     is_lga       : FloatTensor [N]      – 1 if the flight uses LGA, 0 for EWR
     is_at_nyc    : FloatTensor [N]      – 1 if flight touches EWR or LGA
-    train_mask   : BoolTensor  [N]      – months 1-10
+    train_mask   : BoolTensor  [N]      – months 1-8
+    val_mask     : BoolTensor  [N]      – months 9-10
     test_mask    : BoolTensor  [N]      – months 11-12
     carrier_list : list[str]            – carrier codes in OHE column order
     """
     print(f"Loading node features ({node_csv.name})…")
     df = pd.read_csv(node_csv, low_memory=False)
 
-    # Train / test split on FL_DATE month
-    fl_date = pd.to_datetime(df["FL_DATE"])
-    train_mask = (fl_date.dt.month <= 10).values
-    test_mask  = (fl_date.dt.month  > 10).values
-    print(f"  Train months 1-10 : {train_mask.sum():,} flights")
+    # Three-way temporal split (no leakage)
+    fl_date    = pd.to_datetime(df["FL_DATE"])
+    months     = fl_date.dt.month.values
+    train_mask = (months <= 8)
+    val_mask   = (months >= 9) & (months <= 10)
+    test_mask  = (months > 10)
+    print(f"  Train months 1-8  : {train_mask.sum():,} flights")
+    print(f"  Val   months 9-10 : {val_mask.sum():,} flights")
     print(f"  Test  months 11-12: {test_mask.sum():,} flights")
 
     # Identify one-hot column groups
@@ -218,19 +231,25 @@ def load_node_features(node_csv: Path, raw_csv: Path):
         is_at_nyc = np.clip(is_ewr + is_lga, 0, 1).astype(np.float32)
 
     # ── Feature matrix ──────────────────────────────────────────────────────
-    # Drop non-numeric / metadata columns; DEP_DELAY used separately above.
     skip = {"FL_DATE", "DEP_TIME", "DEP_DELAY"}
     feature_cols = [c for c in df.columns if c not in skip]
 
-    # Convert everything to numeric; fill NaNs with column mean, then 0
     feat_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
     col_means = feat_df.mean()
     feat_df = feat_df.fillna(col_means).fillna(0.0)
-    x = feat_df.values.astype(np.float32)                       # [N, F]
+    x_raw = feat_df.values.astype(np.float32)                   # [N, F]
+
+    # ── Feature standardisation (fit on train only, apply to all) ───────────
+    # StandardScaler brings high-range columns (DISTANCE ~2000, HHMM ~1200)
+    # into the same scale as the OHE binary columns, giving the input
+    # projection stable initial gradients.
+    scaler = StandardScaler()
+    scaler.fit(x_raw[train_mask])
+    x = scaler.transform(x_raw).astype(np.float32)
+    print(f"  Features standardised on {train_mask.sum():,} training rows.")
 
     carrier_ohe = df[carrier_cols].astype(np.float32).values    # [N, C]
 
-    # CRS_DEP_TIME and FL_DATE month — used by temporal batch sorter
     crs_dep_times = pd.to_numeric(
         df.get("CRS_DEP_TIME", pd.Series(0, index=df.index)), errors="coerce"
     ).fillna(0).values.astype(np.int32)
@@ -246,6 +265,7 @@ def load_node_features(node_csv: Path, raw_csv: Path):
         torch.from_numpy(is_lga),
         torch.from_numpy(is_at_nyc),
         torch.from_numpy(train_mask),
+        torch.from_numpy(val_mask),
         torch.from_numpy(test_mask),
         carrier_list,
         origin_list,
@@ -423,7 +443,7 @@ def main():
 
     # ── Load processed data ──────────────────────────────────────────────
     (x, delay, carrier_ohe, is_lga, is_at_nyc,
-     train_mask, test_mask, carrier_list, origin_list,
+     train_mask, val_mask, test_mask, carrier_list, origin_list,
      feature_cols, crs_dep_times, fl_months) = load_node_features(NODE_CSV, RAW_CSV)
 
     turnaround_ei, congestion_ei = load_edges(EDGE_CSV)
@@ -432,19 +452,17 @@ def main():
     N     = x.size(0)
     F_in  = x.size(1)
     train_ids = train_mask.nonzero(as_tuple=False).squeeze(1)
+    val_ids   = val_mask.nonzero(as_tuple=False).squeeze(1)
     test_ids  = test_mask.nonzero(as_tuple=False).squeeze(1)
     print(f"\nGraph  : {N:,} nodes | F_in={F_in}")
-    print(f"Train  : {len(train_ids):,} seed nodes")
-    print(f"Test   : {len(test_ids):,} seed nodes\n")
+    print(f"Train  : {len(train_ids):,}  Val: {len(val_ids):,}  Test: {len(test_ids):,}\n")
 
-    # ── Temporal sort for training (Step 5) ──────────────────────────────
-    # Sort train seed nodes by (month, departure-time window) so each
-    # mini-batch processes flights from the same congestion window together.
+    # ── Temporal sort for training ────────────────────────────────────────
     print(f"Sorting train nodes into {args.window_hours}-hour temporal windows…")
     train_ids_sorted = temporal_sort_ids(
         train_ids, crs_dep_times, fl_months, args.window_hours
     )
-    print(f"  Done.  First batch window: "
+    print(f"  Done.  First window: "
           f"month={fl_months[train_ids_sorted[0].item()]} "
           f"dep={crs_dep_times[train_ids_sorted[0].item()]:04d}\n")
 
@@ -461,20 +479,20 @@ def main():
         num_workers    = 2,
         persistent_workers = True,
     )
-    # Training: temporally ordered (shuffle=False preserves window grouping)
     train_loader = NeighborLoader(
-        input_nodes=("flight", train_ids_sorted),
-        shuffle=False,
+        input_nodes=("flight", train_ids_sorted), shuffle=False,
         **shared_loader_kwargs,
     )
-    # Test: original order is fine (evaluation only)
+    val_loader = NeighborLoader(
+        input_nodes=("flight", val_ids), shuffle=False,
+        **shared_loader_kwargs,
+    )
     test_loader = NeighborLoader(
-        input_nodes=("flight", test_ids),
-        shuffle=False,
+        input_nodes=("flight", test_ids), shuffle=False,
         **shared_loader_kwargs,
     )
 
-    # ── Model (Step 6: GATConv with num_heads) ────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     model = SpatioTemporalGNN(
         in_channels     = F_in,
         hidden_channels = args.hidden_channels,
@@ -490,11 +508,18 @@ def main():
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-5
+    # Warm-up for first 5 epochs then cosine annealing
+    warmup     = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=5
+    )
+    cosine     = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(args.epochs - 5, 1), eta_min=1e-6
+    )
+    scheduler  = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[5]
     )
 
-    # ── Loss (builds distance table at init – one-time cost) ─────────────
+    # ── Loss ──────────────────────────────────────────────────────────────
     criterion = MultiObjectiveLoss(
         gate_mapping_path = str(GATE_MAP),
         ewr_graphml       = str(EWR_GML),
@@ -504,36 +529,33 @@ def main():
         beta              = args.beta,
         gamma             = args.gamma,
         lam               = args.lam,
+        delay_scale       = args.delay_scale,
+        entropy_weight    = args.entropy_weight,
     ).to(device)
 
-    # ── Training loop ────────────────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print(f"{'Epoch':>6}  {'Tr-Loss':>9}  {'Tr-F1':>8}  {'Tr-F2':>8}  {'Tr-F3':>8}"
-          f"  {'Te-Loss':>9}  {'Te-F1':>8}  {'Te-F2':>8}  {'Te-F3':>8}")
-    print("=" * 80)
+    # ── Training loop with early stopping on val loss ─────────────────────
+    print("\n" + "=" * 100)
+    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-F1':>7}  {'Tr-F2':>7}  {'Tr-F3':>7}"
+          f"  {'VaLoss':>8}  {'Va-F1':>7}  {'Va-F2':>7}  {'Va-F3':>7}  {'*':>2}")
+    print("=" * 100)
 
-    history = []          # [(epoch, tr_f1, tr_f2, tr_f3, te_f1, te_f2, te_f3)]
-    best_test_loss = float("inf")
+    history         = []
+    best_val_loss   = float("inf")
+    no_improve      = 0
 
     for epoch in range(1, args.epochs + 1):
         tr = train_epoch(model, train_loader, optimizer, criterion, device,
                          carrier_ohe, is_lga, is_at_nyc)
-        te = eval_epoch( model, test_loader,  criterion, device,
+        va = eval_epoch( model, val_loader,   criterion, device,
                          carrier_ohe, is_lga, is_at_nyc)
         scheduler.step()
 
-        row = (epoch,
-               tr["f1"], tr["f2"], tr["f3"],
-               te["f1"], te["f2"], te["f3"])
-        history.append(row)
-
-        print(f"{epoch:6d}  {tr['loss']:9.4f}  {tr['f1']:8.4f}  {tr['f2']:8.4f}  "
-              f"{tr['f3']:8.4f}  {te['loss']:9.4f}  {te['f1']:8.4f}  {te['f2']:8.4f}  "
-              f"{te['f3']:8.4f}")
-
-        # Checkpoint best model by total test loss
-        if te["loss"] < best_test_loss:
-            best_test_loss = te["loss"]
+        improved = va["loss"] < best_val_loss
+        marker   = "✓" if improved else ""
+        if improved:
+            best_val_loss = va["loss"]
+            no_improve    = 0
+            import json as _json
             torch.save(
                 {
                     "epoch"        : epoch,
@@ -546,47 +568,70 @@ def main():
                 },
                 OUT_DIR / "best_model.pt",
             )
-            # Also save a human-readable feature schema for the inference API
-            import json as _json
             schema = {
-                "in_channels"  : F_in,
-                "carrier_list" : carrier_list,
-                "origin_list"  : origin_list,
-                "feature_cols" : feature_cols,
-                "num_heads"    : args.num_heads,
+                "in_channels"    : F_in,
+                "carrier_list"   : carrier_list,
+                "origin_list"    : origin_list,
+                "feature_cols"   : feature_cols,
+                "num_heads"      : args.num_heads,
                 "hidden_channels": args.hidden_channels,
-                "num_layers"   : args.num_layers,
+                "num_layers"     : args.num_layers,
             }
             with open(OUT_DIR / "feature_schema.json", "w") as _fh:
                 _json.dump(schema, _fh, indent=2)
+        else:
+            no_improve += 1
 
-    # ── Pareto front analysis (on test objectives) ────────────────────────
-    test_pts = [(r[4], r[5], r[6]) for r in history]   # (F1, F2, F3) at test
-    front_idx = pareto_front_indices(test_pts)
+        row = (epoch,
+               tr["f1"], tr["f2"], tr["f3"],
+               va["f1"], va["f2"], va["f3"])
+        history.append(row)
+
+        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['f1']:7.4f}  {tr['f2']:7.4f}  "
+              f"{tr['f3']:7.2f}  {va['loss']:8.4f}  {va['f1']:7.4f}  {va['f2']:7.4f}  "
+              f"{va['f3']:7.2f}  {marker}")
+
+        if no_improve >= args.patience:
+            print(f"\nEarly stopping at epoch {epoch} "
+                  f"(no val improvement for {args.patience} epochs).")
+            break
+
+    # ── Final test-set evaluation using best checkpoint ───────────────────
+    best_ckpt = torch.load(OUT_DIR / "best_model.pt", map_location=device)
+    model.load_state_dict(best_ckpt["model_state"])
+    te = eval_epoch(model, test_loader, criterion, device,
+                    carrier_ohe, is_lga, is_at_nyc)
+    print(f"\nTest  (best ckpt epoch {best_ckpt['epoch']}):"
+          f"  F1={te['f1']:.4f}  F2={te['f2']:.4f}  F3={te['f3']:.2f} min")
+
+    # ── Pareto front analysis (on val objectives — no test leakage) ───────
+    val_pts  = [(r[4], r[5], r[6]) for r in history]
+    front_idx = pareto_front_indices(val_pts)
 
     pareto_rows = [
-        {
-            "epoch":   history[i][0],
-            "test_F1": history[i][4],
-            "test_F2": history[i][5],
-            "test_F3": history[i][6],
-        }
+        {"epoch": history[i][0],
+         "val_F1": history[i][4], "val_F2": history[i][5], "val_F3": history[i][6]}
         for i in front_idx
     ]
-    pareto_df = pd.DataFrame(pareto_rows).sort_values("test_F1")
+    pareto_df = pd.DataFrame(pareto_rows).sort_values("val_F1")
     pareto_df.to_csv(OUT_DIR / "pareto_front.csv", index=False)
-
-    print("\n" + "=" * 80)
-    print("Pareto-optimal epochs on the test set (non-dominated trade-offs):")
+    print("\nPareto-optimal epochs (val set):")
     print(pareto_df.to_string(index=False))
 
-    # Save full epoch history
+    # Save full epoch history (train + val; test row appended separately)
     hist_df = pd.DataFrame(
         history,
         columns=["epoch", "train_F1", "train_F2", "train_F3",
-                 "test_F1",  "test_F2",  "test_F3"],
+                 "val_F1",   "val_F2",   "val_F3"],
     )
     hist_df.to_csv(OUT_DIR / "training_history.csv", index=False)
+
+    # Save test metrics to a separate file for clean reporting
+    test_row = pd.DataFrame([{
+        "best_epoch": best_ckpt["epoch"],
+        "test_F1": te["f1"], "test_F2": te["f2"], "test_F3": te["f3"],
+    }])
+    test_row.to_csv(OUT_DIR / "test_metrics.csv", index=False)
     print(f"\nOutputs written to {OUT_DIR}/")
 
 

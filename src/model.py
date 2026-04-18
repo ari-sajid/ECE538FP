@@ -73,7 +73,7 @@ class SpatioTemporalGNN(nn.Module):
         hidden_channels: int = 128,
         num_gates: int = NUM_GATES,
         num_layers: int = 3,
-        dropout: float = 0.3,
+        dropout: float = 0.2,
         num_heads: int = 4,
     ):
         super().__init__()
