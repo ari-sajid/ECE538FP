@@ -325,9 +325,9 @@ def train_epoch(model, loader, optimizer, criterion, device,
         delay_true_s  = batch["flight"].y_delay[:n_seed].to(device)
 
         # Per-flight metadata (loaded from CPU, indexed by global seed IDs)
-        c_ohe = carrier_ohe_all[seed_ids].to(device)
-        lga   = is_lga_all[seed_ids].to(device)
-        nyc   = is_at_nyc_all[seed_ids].to(device)
+        c_ohe = carrier_ohe_all[seed_ids.cpu()].to(device)
+        lga   = is_lga_all[seed_ids.cpu()].to(device)
+        nyc   = is_at_nyc_all[seed_ids.cpu()].to(device)
 
         loss, f1, f2, f3 = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
@@ -374,9 +374,9 @@ def eval_epoch(model, loader, criterion, device,
         delay_pred_s  = delay_pred[:n_seed]
         delay_true_s  = batch["flight"].y_delay[:n_seed].to(device)
 
-        c_ohe = carrier_ohe_all[seed_ids].to(device)
-        lga   = is_lga_all[seed_ids].to(device)
-        nyc   = is_at_nyc_all[seed_ids].to(device)
+        c_ohe = carrier_ohe_all[seed_ids.cpu()].to(device)
+        lga   = is_lga_all[seed_ids.cpu()].to(device)
+        nyc   = is_at_nyc_all[seed_ids.cpu()].to(device)
 
         loss, f1, f2, f3 = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
