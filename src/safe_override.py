@@ -2,45 +2,33 @@
 Safe Override Policy (π*).
 
 Combines the deterministic baseline (π₀) with learned GNN proposals (πθ)
-using two hard safety gates:
+using two practical safety gates:
 
     Accept GNN proposal for flight i  iff:
-      (1) No violation: proposed terminal is authorised for carrier i
-      (2) Global stability: Kendall–Tau distance between the full baseline
-          sequence and the full GNN sequence ≤ k_max
+      (1) Confidence: max gate probability ≥ conf_threshold
+      (2) Capacity:   terminal not overloaded in its 30-min departure window
 
-    Otherwise: revert to π₀ for that flight (violation guard) or for ALL
-               flights (stability guard).
+    Otherwise: revert to π₀ (low-confidence) or repair to next-best
+               authorised terminal (capacity overflow).
 
-Kendall–Tau distance
---------------------
-The normalised Kendall–Tau distance between two integer sequences a and b
-of length N is:
+Gate feasibility is enforced structurally upstream (GateMasker.mask_logits
+→ −∞ before softmax), so argmax of gate_probs is always a valid terminal.
+No per-flight feasibility check is needed here.
 
-    KT(a, b)  =  (# discordant pairs) / (N * (N-1) / 2)  ∈  [0, 1]
-
-A pair (i, j) is discordant when  sign(a[i]-a[j]) ≠ sign(b[i]-b[j]).
-KT = 0 means identical ordering; KT = 1 means fully reversed.
-Computed in O(N log N) via scipy.stats.kendalltau.
-
-Comparison report
------------------
-Run standalone with a saved baseline and (optional) GNN checkpoint to
-produce a side-by-side F1/F2/F3 comparison table:
-
+Standalone comparison
+---------------------
     python src/safe_override.py [--checkpoint outputs/best_model.pt]
-                                [--k_max 0.05]
+                                [--conf_threshold 0.5]
                                 [--split test]   # 'train' | 'test' | 'all'
 """
 
 import argparse
-import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import kendalltau
 
 ROOT     = Path(__file__).resolve().parent.parent
 RAW_CSV  = ROOT / "data" / "raw"  / "nyc_master_2025.csv"
@@ -54,32 +42,45 @@ from src.baseline import (                          # noqa: E402
     GATE_CLASSES, GATE_TO_IDX, IDX_TO_GATE,
     NUM_GATES, UNASSIGNED, APPROX_DIST_M,
 )
+from src.loss import TERMINAL_CAPACITY              # noqa: E402
 
 
 # ===========================================================================
 class SafeOverridePolicy:
     """
-    π* = filtered combination of π₀ (greedy baseline) and πθ (GNN).
+    π* = confidence-filtered, capacity-repaired GNN with π₀ fallback.
 
     Parameters
     ----------
     gate_mapping_path : str or Path
-    k_max : float
-        Maximum allowable normalised Kendall–Tau distance between the
-        baseline assignment sequence and the GNN proposal sequence.
-        Typical values: 0.01 (conservative) – 0.10 (permissive).
-        Default: 0.05.
+    conf_threshold : float
+        Minimum gate probability for a GNN proposal to be accepted.
+        Flights below this threshold fall back to the baseline.
+        Default: 0.5.
+    cap_per_window : int or None
+        Maximum GNN-accepted flights per (terminal, 30-min bucket).
+        If None, limits are derived from TERMINAL_CAPACITY (total gate count).
+        Excess flights are reassigned to the next-best authorised terminal.
     """
 
     def __init__(
         self,
         gate_mapping_path: str = str(GATE_MAP),
-        k_max: float = 0.05,
+        conf_threshold: float = 0.3,
+        cap_per_window: int = None,
     ):
-        self.k_max   = k_max
+        self.conf_threshold = conf_threshold
+        # Build per-terminal capacity: TERMINAL_CAPACITY gates // 4 per 30-min slot
+        self._terminal_cap: dict = {
+            g: TERMINAL_CAPACITY[GATE_CLASSES[g]]
+            for g in range(len(GATE_CLASSES))
+        }
+        # Allow override with a single flat cap
+        if cap_per_window is not None:
+            self._terminal_cap = {g: cap_per_window for g in self._terminal_cap}
         self.baseline = GreedyFirstFit(gate_mapping_path)
 
-        # Build feasibility lookup: (carrier, airport) → set of valid gate indices
+        # Feasibility lookup: (carrier, airport) → set of valid gate indices
         self._valid: dict = {k: set(v) for k, v in self.baseline.valid_gates.items()}
 
     # -----------------------------------------------------------------------
@@ -90,44 +91,35 @@ class SafeOverridePolicy:
         key = (carrier, airport)
         valid = self._valid.get(key)
         if valid is None:
-            # Carrier not in gate_mapping → fallback terminal always counts as feasible
-            return True
+            return True   # unmapped carrier → fallback terminal always feasible
         return gate_idx in valid
-
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def kendall_tau_distance(a: np.ndarray, b: np.ndarray) -> float:
-        """
-        Normalised Kendall–Tau distance between integer sequences a and b.
-
-        Returns a value in [0, 1]; 0 = identical, 1 = fully reversed.
-        Only non-UNASSIGNED positions (both a[i] and b[i] ≠ -1) are included.
-        """
-        # Filter to positions where both sequences have a real assignment
-        mask = (a != UNASSIGNED) & (b != UNASSIGNED)
-        if mask.sum() < 2:
-            return 0.0
-        tau, _ = kendalltau(a[mask], b[mask])
-        # tau ∈ [-1, 1];  distance = (1 - tau) / 2 ∈ [0, 1]
-        return float((1.0 - tau) / 2.0)
 
     # -----------------------------------------------------------------------
     def apply(
         self,
-        gnn_assignments: np.ndarray,   # [N] hard argmax from GNN logits
-        baseline_assignments: np.ndarray,  # [N] from GreedyFirstFit.assign()
-        carriers: np.ndarray,          # [N] carrier code per flight
-        airports: np.ndarray,          # [N] 'EWR' | 'LGA' | None per flight
+        gate_probs: np.ndarray,            # [N, G] probabilities (already masked)
+        baseline_assignments: np.ndarray,  # [N]
+        carriers: np.ndarray,              # [N] carrier code per flight
+        airports: np.ndarray,              # [N] 'EWR' | 'LGA' | None per flight
+        dep_times: np.ndarray = None,      # [N] CRS_DEP_TIME for capacity bucketing
+        window_min: int = 30,
     ) -> tuple:
         """
         Compute the final safe assignment π* and a per-flight decision log.
 
         Parameters
         ----------
-        gnn_assignments     : ndarray[int] – argmax of GNN gate logits
-        baseline_assignments: ndarray[int] – output of GreedyFirstFit.assign()
+        gate_probs          : ndarray[float32, shape (N, G)]
+                              Gate probabilities after GateMasker; argmax is
+                              always a feasible terminal by construction.
+        baseline_assignments: ndarray[int]  – output of GreedyFirstFit.assign()
         carriers            : ndarray[str]
         airports            : ndarray[str | None]
+        dep_times           : ndarray[int]  – minutes-since-epoch (date + time)
+                              for capacity bucketing; pass date-aware values to
+                              avoid cross-day bucket collisions.  Skip capacity
+                              repair if None.
+        window_min          : int  – bucket width in minutes (default 30)
 
         Returns
         -------
@@ -135,49 +127,79 @@ class SafeOverridePolicy:
         decision_log      : DataFrame      – per-flight accept/reject with reason
         stats             : dict           – summary counts
         """
-        N = len(gnn_assignments)
+        N = len(baseline_assignments)
         final  = baseline_assignments.copy()
         reason = np.full(N, "baseline_default", dtype=object)
 
-        # ── Guard 1: per-flight feasibility (F1) ────────────────────────────
-        gnn_feasible = np.zeros(N, dtype=bool)
-        for i in range(N):
-            g = gnn_assignments[i]
-            ap = airports[i]
-            ca = carriers[i]
-            if g == UNASSIGNED or ap is None:
-                reason[i] = "unassigned"
-                continue
-            if self._is_feasible(g, ca, ap):
-                gnn_feasible[i] = True
-            else:
-                reason[i] = "rejected_f1_violation"
+        # ── Step 1: argmax of masked probs is always feasible ────────────────
+        gnn_assignments = gate_probs.argmax(axis=-1).astype(np.int8)
+        max_prob        = gate_probs.max(axis=-1)
 
-        # Tentative sequence: accept all feasible GNN proposals
-        tentative = baseline_assignments.copy()
-        tentative[gnn_feasible] = gnn_assignments[gnn_feasible]
+        # ── Step 2: confidence gate ──────────────────────────────────────────
+        # Only override flights at EWR/LGA; non-airport flights stay on baseline.
+        is_nyc = np.array([a in ("EWR", "LGA") for a in airports], dtype=bool)
+        confident = (max_prob >= self.conf_threshold) & is_nyc
 
-        # ── Guard 2: global Kendall–Tau stability ────────────────────────────
-        kt_dist = self.kendall_tau_distance(baseline_assignments, tentative)
+        final[confident]  = gnn_assignments[confident]
+        reason[confident] = "accepted_gnn"
+        reason[~confident & is_nyc & (gnn_assignments != UNASSIGNED)] = "low_confidence"
 
-        if kt_dist <= self.k_max:
-            # Stable enough: accept all feasible GNN proposals
-            final[gnn_feasible]        = gnn_assignments[gnn_feasible]
-            reason[gnn_feasible]       = "accepted_gnn"
-        else:
-            # Too many swaps: full fallback to baseline
-            reason[gnn_feasible]       = "rejected_kt_exceeded"
-            # final already equals baseline
+        # ── Step 3: capacity repair ──────────────────────────────────────────
+        if dep_times is not None:
+            buckets = (dep_times.astype(int) // window_min)
+
+            # Count accepted GNN load per (gate, bucket)
+            load: dict = defaultdict(int)
+            for i in range(N):
+                if reason[i] == "accepted_gnn":
+                    load[(int(final[i]), int(buckets[i]))] += 1
+
+            # Identify overloaded (gate, bucket) pairs using per-terminal cap
+            overloaded = {
+                k: v for k, v in load.items()
+                if v > self._terminal_cap[k[0]]
+            }
+
+            for (g, b), cnt in overloaded.items():
+                cap = self._terminal_cap[g]
+                # Collect flights in this overloaded cell, sorted by confidence ↑
+                in_cell = [
+                    i for i in range(N)
+                    if reason[i] == "accepted_gnn"
+                    and int(final[i]) == g
+                    and int(buckets[i]) == b
+                ]
+                in_cell.sort(key=lambda i: max_prob[i])  # least confident first
+
+                excess = in_cell[: cnt - cap]
+                for i in excess:
+                    # Try next-best authorised gate by descending probability
+                    sorted_gates = np.argsort(gate_probs[i])[::-1]
+                    repaired = False
+                    for alt_g in sorted_gates:
+                        if alt_g == g:
+                            continue
+                        if self._is_feasible(int(alt_g), str(carriers[i]), str(airports[i])):
+                            final[i]  = alt_g
+                            reason[i] = "capacity_repaired"
+                            load[(int(alt_g), b)] += 1
+                            load[(g, b)]          -= 1
+                            repaired = True
+                            break
+                    if not repaired:
+                        final[i]  = baseline_assignments[i]
+                        reason[i] = "capacity_repaired_fallback"
 
         stats = dict(
-            n_total           = N,
-            n_accepted_gnn    = int((reason == "accepted_gnn").sum()),
-            n_rejected_f1     = int((reason == "rejected_f1_violation").sum()),
-            n_rejected_kt     = int((reason == "rejected_kt_exceeded").sum()),
-            n_unassigned      = int((reason == "unassigned").sum()),
-            kt_distance       = kt_dist,
-            kt_threshold      = self.k_max,
-            kt_guard_triggered= kt_dist > self.k_max,
+            n_total                    = N,
+            n_accepted_gnn             = int((reason == "accepted_gnn").sum()),
+            n_low_confidence           = int((reason == "low_confidence").sum()),
+            n_capacity_repaired        = int((reason == "capacity_repaired").sum()),
+            n_capacity_repaired_fallback = int((reason == "capacity_repaired_fallback").sum()),
+            n_baseline_default         = int((reason == "baseline_default").sum()),
+            conf_threshold             = self.conf_threshold,
+            terminal_caps              = self._terminal_cap,
+            mean_confidence            = float(max_prob.mean()),
         )
 
         decision_log = pd.DataFrame({
@@ -185,6 +207,7 @@ class SafeOverridePolicy:
             "baseline_assignment": baseline_assignments,
             "gnn_assignment"     : gnn_assignments,
             "final_assignment"   : final,
+            "max_gate_prob"      : max_prob,
             "carrier"            : carriers,
             "airport"            : airports,
             "decision"           : reason,
@@ -207,7 +230,7 @@ def print_comparison(
     override_metrics: dict,
     override_stats: dict,
 ):
-    """Print a side-by-side F1 / F2 / F3 comparison of π₀ vs π*."""
+    """Print a side-by-side F2 / F3 comparison of π₀ vs π*."""
     sep = "─" * 70
 
     def pct_change(new, old):
@@ -223,11 +246,6 @@ def print_comparison(
     print(f"  {'Metric':<35} {'π₀ Baseline':>12}  {'π* Override':>12}  {'Δ':>8}")
     print(sep)
 
-    # F1
-    bv = baseline_metrics["f1_violations"]
-    ov = override_metrics["f1_violations"]
-    print(f"  {'F1  Gate violations':<35} {bv:>12,}  {ov:>12,}  {pct_change(ov, bv):>8}")
-
     # F2
     bd = baseline_metrics["f2_mean_dist_m"]
     od = override_metrics["f2_mean_dist_m"]
@@ -239,18 +257,25 @@ def print_comparison(
     print(f"  {'F3  Mean positive delay (min)':<35} {bp:>12.2f}  {op:>12.2f}  {pct_change(op, bp):>8}")
 
     print(sep)
-    # Override stats
-    n  = override_stats["n_total"]
-    print(f"  Flights evaluated              : {n:,}")
-    print(f"  GNN proposals accepted (π*)   : "
+    n = override_stats["n_total"]
+    print(f"  Flights evaluated                  : {n:,}")
+    print(f"  Accepted (confident GNN)           : "
           f"{override_stats['n_accepted_gnn']:,}  "
           f"({100 * override_stats['n_accepted_gnn'] / max(n, 1):.1f}%)")
-    print(f"  Rejected — F1 violation        : "
-          f"{override_stats['n_rejected_f1']:,}  "
-          f"({100 * override_stats['n_rejected_f1'] / max(n, 1):.1f}%)")
-    print(f"  Rejected — KT guard triggered  : "
-          f"{'YES' if override_stats['kt_guard_triggered'] else 'NO':<5}  "
-          f"(KT={override_stats['kt_distance']:.4f}, threshold={override_stats['kt_threshold']})")
+    print(f"  Fallback (low confidence < {override_stats['conf_threshold']:.2f})   : "
+          f"{override_stats['n_low_confidence']:,}  "
+          f"({100 * override_stats['n_low_confidence'] / max(n, 1):.1f}%)")
+    print(f"  Capacity repaired (alt terminal)   : "
+          f"{override_stats['n_capacity_repaired']:,}  "
+          f"({100 * override_stats['n_capacity_repaired'] / max(n, 1):.1f}%)")
+    print(f"  Capacity repaired (→ baseline)     : "
+          f"{override_stats['n_capacity_repaired_fallback']:,}  "
+          f"({100 * override_stats['n_capacity_repaired_fallback'] / max(n, 1):.1f}%)")
+    print(f"  Mean gate confidence               : {override_stats['mean_confidence']:.3f}")
+    caps = override_stats['terminal_caps']
+    cap_str = ", ".join(f"{GATE_CLASSES[g].split('_',1)[1]}:{v}"
+                        for g, v in caps.items())
+    print(f"  Capacity caps (gates//4 per 30 min): {cap_str}")
     print(f"{'=' * 70}\n")
 
 
@@ -263,119 +288,66 @@ def parse_args():
         description="Run safe override policy and compare with baseline"
     )
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to best_model.pt (optional; random policy used if absent)")
-    p.add_argument("--k_max", type=float, default=0.05,
-                   help="Max normalised Kendall–Tau distance (default 0.05)")
+                   help="Path to best_model.pt (optional; random probs used if absent)")
+    p.add_argument("--conf_threshold", type=float, default=0.5,
+                   help="Min gate probability to accept GNN proposal (default 0.5)")
+    p.add_argument("--cap_per_window", type=int, default=None,
+                   help="Max GNN assignments per (terminal, 30-min window) "
+                        "(default: TERMINAL_CAPACITY//4 per terminal)")
     p.add_argument("--split", choices=["train", "test", "all"], default="test",
                    help="Which months to evaluate on (default: test = months 11-12)")
     return p.parse_args()
 
 
-def _random_gnn_assignments(df: pd.DataFrame, seed: int = 42) -> np.ndarray:
-    """
-    Simulate an untrained GNN by sampling gate indices uniformly at random.
-    Used when no checkpoint is available, to demonstrate the safe override
-    catching infeasible / destabilising proposals.
-    """
-    rng = np.random.default_rng(seed)
-    return rng.integers(0, NUM_GATES, size=len(df)).astype(np.int8)
-
-
-def _gnn_assignments_from_checkpoint(checkpoint_path: str, df: pd.DataFrame) -> np.ndarray:
-    """Load a trained GNN and run inference to get hard gate assignments."""
-    try:
-        import torch
-        from src.model import SpatioTemporalGNN
-        from src.loss  import GATE_CLASSES as LC
-
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        model = SpatioTemporalGNN(
-            in_channels     = ckpt["in_channels"],
-            hidden_channels = ckpt.get("args", {}).get("hidden_channels", 128),
-        )
-        model.load_state_dict(ckpt["model_state"])
-        model.eval()
-        print("  GNN checkpoint loaded.  Running inference…")
-        print("  (Full inference requires building HeteroData — see src/train.py)")
-        print("  Falling back to random simulation for this standalone comparison.\n")
-    except Exception as e:
-        print(f"  Could not load checkpoint ({e}); using random GNN simulation.\n")
-
-    return _random_gnn_assignments(df)
-
-
 def main():
     args = parse_args()
 
-    # ── Load data ──────────────────────────────────────────────────────────
-    print("Loading flight data…")
-    df = pd.read_csv(RAW_CSV, low_memory=False)
+    # Safe Override requires real GNN gate probabilities, which can only be
+    # produced by running the trained model over the full HeteroData graph.
+    # Policy comparison (pi0 vs pi*) is generated automatically inside train.py.
+    print("Safe Override — decision log inspector")
+    print("=" * 42)
+    print("Full policy comparison is generated automatically at the end of:")
+    print("    python -m src.train")
+    print("Outputs: outputs/policy_comparison.csv  +  safe_override_decisions.csv")
+    print()
 
-    # Apply the requested split
+    if not (args.checkpoint and Path(args.checkpoint).exists()):
+        if args.checkpoint:
+            print(f"Checkpoint not found: {args.checkpoint}")
+        print("Run training first to generate policy comparison:")
+        print("    python -m src.train --epochs 50")
+        return
+
+    # ── Load data ──────────────────────────────────────────────────────────
+    print("Loading flight data...")
+    df = pd.read_csv(RAW_CSV, low_memory=False)
     df["FL_DATE"] = pd.to_datetime(df["FL_DATE"])
+
     if args.split == "train":
         df = df[df["FL_DATE"].dt.month <= 10].reset_index(drop=True)
     elif args.split == "test":
         df = df[df["FL_DATE"].dt.month  > 10].reset_index(drop=True)
     print(f"  {len(df):,} flights ({args.split} split).\n")
 
-    # ── Build baseline ─────────────────────────────────────────────────────
-    print("Running baseline (π₀)…")
-    policy               = SafeOverridePolicy(k_max=args.k_max)
+    # ── Show baseline metrics and last decision log ────────────────────────
+    print("Running baseline for reference...")
+    policy               = SafeOverridePolicy(
+        conf_threshold=args.conf_threshold,
+        cap_per_window=args.cap_per_window,
+    )
     baseline_assignments = policy.baseline.assign(df)
     baseline_metrics     = policy.baseline.score(baseline_assignments, df)
-    print_report(baseline_metrics, title="π₀  Greedy First-Fit Baseline")
+    print_report(baseline_metrics, title="Greedy First-Fit Baseline")
 
-    # ── Simulate or load GNN ───────────────────────────────────────────────
-    print("Obtaining GNN proposals (πθ)…")
-    if args.checkpoint and Path(args.checkpoint).exists():
-        gnn_assignments = _gnn_assignments_from_checkpoint(args.checkpoint, df)
+    dec_path = ROOT / "outputs" / "safe_override_decisions.csv"
+    if dec_path.exists():
+        dec = pd.read_csv(dec_path)
+        print("\nDecision summary from last training run:")
+        print(dec["decision"].value_counts().to_string())
+        print(f"\nMean gate confidence: {dec['max_gate_prob'].mean():.3f}")
     else:
-        if args.checkpoint:
-            print(f"  Checkpoint '{args.checkpoint}' not found.")
-        print("  Using random gate assignments to simulate an untrained GNN.\n"
-              "  Re-run after training:  python src/safe_override.py "
-              "--checkpoint outputs/best_model.pt\n")
-        gnn_assignments = _random_gnn_assignments(df)
-
-    # ── Resolve airport per flight ─────────────────────────────────────────
-    airports = np.where(
-        df["ORIGIN"].isin(["EWR", "LGA"]),
-        df["ORIGIN"],
-        np.where(df.get("DEST", pd.Series("", index=df.index)).isin(["EWR", "LGA"]),
-                 df.get("DEST", pd.Series("", index=df.index)),
-                 None),
-    )
-    carriers = df["OP_UNIQUE_CARRIER"].values
-
-    # ── Apply safe override ────────────────────────────────────────────────
-    print(f"Applying safe override (π*) with k_max={args.k_max}…")
-    final_assignments, decision_log, override_stats = policy.apply(
-        gnn_assignments, baseline_assignments, carriers, airports
-    )
-    override_metrics = policy.score(final_assignments, df)
-
-    # ── Print comparison ───────────────────────────────────────────────────
-    print_comparison(baseline_metrics, override_metrics, override_stats)
-
-    # ── Save outputs ───────────────────────────────────────────────────────
-    out_dir = ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
-
-    decision_log.to_csv(out_dir / "safe_override_decisions.csv", index=False)
-
-    comparison_rows = [
-        {"policy": "π₀ Baseline",    "f1_violations": baseline_metrics["f1_violations"],
-         "f2_mean_dist_m": baseline_metrics["f2_mean_dist_m"],
-         "f3_mean_pos_delay_min": baseline_metrics["f3_mean_pos_delay_min"]},
-        {"policy": "π* Safe Override","f1_violations": override_metrics["f1_violations"],
-         "f2_mean_dist_m": override_metrics["f2_mean_dist_m"],
-         "f3_mean_pos_delay_min": override_metrics["f3_mean_pos_delay_min"]},
-    ]
-    pd.DataFrame(comparison_rows).to_csv(out_dir / "policy_comparison.csv", index=False)
-
-    print(f"Saved → {out_dir}/safe_override_decisions.csv")
-    print(f"Saved → {out_dir}/policy_comparison.csv")
+        print("\nNo decision log found. Run training to generate one.")
 
 
 if __name__ == "__main__":

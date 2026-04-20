@@ -1,3 +1,4 @@
-policy,f1_violations,f2_mean_dist_m,f3_mean_pos_delay_min
-π₀ Baseline,0,767.0748901367188,23.051106164539135
-π* Safe Override,0,767.0748901367188,23.051106164539135
+policy,f2_mean_dist_m,f3_mean_pos_delay_min
+GreedyFirstFit (pi0),767.0748901367188,23.051106164539135
+GreedyBalanced (alpha=0.5),768.2200317382812,23.051106164539135
+GNN Safe Override,767.0748901367188,23.051106164539135

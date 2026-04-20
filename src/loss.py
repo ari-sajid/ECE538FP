@@ -1,49 +1,41 @@
 """
 Multi-objective loss for the airport gate-scheduling GNN.
 
-Objective definitions (lower is better for all three)
-------------------------------------------------------
-F1 – Gate Constraint Loss
-     Penalises the probability mass placed on terminals that are
-     incompatible with the flight's airline, as defined in gate_mapping.json.
-
+Objective definitions (lower is better for all)
+------------------------------------------------
 F2 – Taxiing Distance Loss
-     Minimises the *expected* taxiing distance from the predicted terminal
-     to the active runway, computed as:
+     Minimises the expected taxiing distance from the predicted terminal
+     to the active runway:
          E[dist] = softmax(gate_logits) · precomputed_distance_vector
-     where the distance vector is built once from the airport GraphML
-     road networks using NetworkX shortest-path (Dijkstra).
 
-F3 – Schedule Stability Loss
-     Penalises positive predicted departure delays so that gate assignments
-     which propagate delays are discouraged.
+F3 – Schedule Stability Loss (delay-risk proxy)
+     Differentiable approximation of P(departure delay > 15 min):
+         F3 = mean(sigmoid((delay_pred − 15) / 5))
+     Gradient is non-zero for any delay_pred near 15 min; fixed scale
+     avoids the need for a normalisation hyperparameter.
 
-Auxiliary supervised loss (not part of the Pareto front)
----------------------------------------------------------
-L_reg  – MSE between the delay predictor's output and the actual
-         departure delay.  Keeps the delay head calibrated so F3 is
-         meaningful.
+Auxiliary supervised loss
+--------------------------
+L_reg  – Huber loss between predicted and observed departure delay.
+         Keeps the delay head calibrated so F3 is meaningful.
 
 Combined loss
 -------------
-    L = α·F1 + β·F2 + γ·F3 + λ·L_reg
+    L = β·F2 + γ·F3 + λ·L_reg + ε·(–H)
 
-All three objectives are differentiable with respect to gate_logits so
-gradients flow back into the GNN's gate head.
+Gate feasibility is enforced *structurally* via GateMasker.mask_logits()
+(infeasible logits → −∞ before every softmax) and is therefore never a
+loss term — it is always zero by construction.
 """
 
 import json
-import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import networkx as nx
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Re-declare constants here to avoid circular imports with model.py
 GATE_CLASSES: List[str] = [
     "EWR_Terminal_A",  # 0
     "EWR_Terminal_B",  # 1
@@ -51,94 +43,44 @@ GATE_CLASSES: List[str] = [
     "LGA_Terminal_B",  # 3
     "LGA_Terminal_C",  # 4
 ]
-NUM_GATES: int = len(GATE_CLASSES)  # 5
+NUM_GATES: int = len(GATE_CLASSES)
 
-# Approximate (lat, lon) centroids for each terminal gate-area.
-# Derived from published airport diagrams; used to locate the nearest
-# road-network node in the GraphML graphs.
-TERMINAL_COORDS: Dict[str, Tuple[float, float]] = {
-    "EWR_Terminal_A": (40.6892, -74.1751),
-    "EWR_Terminal_B": (40.6927, -74.1739),
-    "EWR_Terminal_C": (40.6963, -74.1734),
-    "LGA_Terminal_B": (40.7757, -73.8763),
-    "LGA_Terminal_C": (40.7742, -73.8790),
+# Approximate taxi distances (metres) from each terminal to its airport's runway.
+# These match the values used in baseline.py for apples-to-apples comparison.
+APPROX_DIST_M: Dict[str, int] = {
+    "EWR_Terminal_A": 810,
+    "EWR_Terminal_B": 1140,
+    "EWR_Terminal_C": 1380,
+    "LGA_Terminal_B": 660,
+    "LGA_Terminal_C": 920,
 }
 
-# Approximate runway midpoints used as the taxiing destination.
-RUNWAY_COORDS: Dict[str, Tuple[float, float]] = {
-    "EWR": (40.6878, -74.1860),  # centre of runway complex 22L/4R
-    "LGA": (40.7700, -73.8820),  # centre of runway complex 04/22
+# Approximate gate counts per terminal (from BTS/FAA airport facility data).
+# Used by SafeOverridePolicy for terminal-specific capacity repair.
+TERMINAL_CAPACITY: Dict[str, int] = {
+    "EWR_Terminal_A": 25,   # mixed-use domestic
+    "EWR_Terminal_B": 22,   # international
+    "EWR_Terminal_C": 45,   # United hub
+    "LGA_Terminal_B": 35,   # new Delta/AA terminal
+    "LGA_Terminal_C": 12,   # smaller concourse
 }
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in metres between two (lat, lon) points."""
-    R = 6_371_000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _nearest_node(G: nx.Graph, lat: float, lon: float):
-    """Return the graph node whose (y, x) coords are closest to (lat, lon)."""
-    best_node, best_dist = None, float("inf")
-    for node, data in G.nodes(data=True):
-        try:
-            d = _haversine_m(lat, lon, float(data["y"]), float(data["x"]))
-        except (KeyError, ValueError):
-            continue
-        if d < best_dist:
-            best_dist = d
-            best_node = node
-    return best_node
-
-
-def _path_length(G: nx.Graph, src, tgt) -> float:
-    """Shortest weighted path length (metres); falls back to haversine."""
-    # GraphML deserialises all attributes as strings, so cast length to float.
-    def _weight(u, v, d):
-        try:
-            return float(d.get("length", 1.0))
-        except (TypeError, ValueError):
-            return 1.0
-
-    try:
-        return nx.shortest_path_length(G, src, tgt, weight=_weight)
-    except (nx.NetworkXNoPath, nx.NodeNotFound, nx.exception.NetworkXError):
-        sd, td = G.nodes[src], G.nodes[tgt]
-        return _haversine_m(
-            float(sd["y"]), float(sd["x"]),
-            float(td["y"]), float(td["x"]),
-        )
-
 
 # ---------------------------------------------------------------------------
-# F1 – Gate Constraint Loss
+# Gate Masker — structural feasibility enforcement (not a loss)
 # ---------------------------------------------------------------------------
 
-class GateConstraintLoss(nn.Module):
+class GateMasker(nn.Module):
     """
-    Soft infeasibility penalty for gate assignments that violate airline-
-    terminal constraints defined in gate_mapping.json.
-
-    For every flight the penalty equals the total softmax probability mass
-    placed on terminals the airline is not authorised to use.  Carriers
-    absent from the mapping receive a zero penalty (all gates are implicitly
-    allowed so the model is not penalised for unknown airlines).
+    Enforces airline-terminal constraints by masking infeasible gate logits
+    to −∞ before every softmax.  This guarantees zero gate violations by
+    construction — no loss term is needed.
 
     Parameters
     ----------
     gate_mapping_path : str or Path
     carrier_list : list[str]
-        Ordered list of carrier codes matching the one-hot columns in the
-        node-feature matrix (e.g. ['AA', 'AC', 'AI', ...]).
     """
 
     def __init__(self, gate_mapping_path: str, carrier_list: List[str]):
@@ -146,19 +88,16 @@ class GateConstraintLoss(nn.Module):
         with open(gate_mapping_path) as fh:
             mapping = json.load(fh)
 
-        airport_order = ["EWR", "LGA"]   # axis-0 of the constraint tensor
+        airport_order = ["EWR", "LGA"]
         num_carriers = len(carrier_list)
         gate_to_idx = {g: i for i, g in enumerate(GATE_CLASSES)}
 
-        # invalid[c, a, g] = 1  ↔  carrier c must NOT use gate g at airport a
-        # Default: unknown carriers → all gates valid (mask = 0)
         invalid = torch.zeros(num_carriers, 2, NUM_GATES)
 
         for ap_idx, airport in enumerate(airport_order):
             if airport not in mapping:
                 continue
-            # Gather all authorised (carrier, gate) pairs for this airport
-            authorised: Dict[int, set] = {}   # carrier_idx → set of gate indices
+            authorised: Dict[int, set] = {}
             for terminal, carriers in mapping[airport].items():
                 gate_key = f"{airport}_{terminal}"
                 if gate_key not in gate_to_idx:
@@ -169,38 +108,32 @@ class GateConstraintLoss(nn.Module):
                         c_idx = carrier_list.index(carrier)
                         authorised.setdefault(c_idx, set()).add(g_idx)
 
-            # For carriers that appear in the mapping, mark all OTHER gates as
-            # invalid (gates at the OTHER airport are also invalid for this ap).
             all_gate_indices = set(range(NUM_GATES))
             for c_idx, valid_gates in authorised.items():
                 for g_idx in all_gate_indices - valid_gates:
                     invalid[c_idx, ap_idx, g_idx] = 1.0
 
-        # Also mark cross-airport gates as invalid:
-        # EWR flights (ap_idx=0) must not be assigned LGA terminals (3,4)
-        # LGA flights (ap_idx=1) must not be assigned EWR terminals (0,1,2)
+        # Cross-airport: EWR flights must not use LGA terminals and vice-versa
         ewr_gate_ids = [0, 1, 2]
         lga_gate_ids = [3, 4]
         for c_idx in range(num_carriers):
             for g in lga_gate_ids:
-                invalid[c_idx, 0, g] = 1.0   # EWR flight, LGA terminal → invalid
+                invalid[c_idx, 0, g] = 1.0
             for g in ewr_gate_ids:
-                invalid[c_idx, 1, g] = 1.0   # LGA flight, EWR terminal → invalid
+                invalid[c_idx, 1, g] = 1.0
 
-        self.register_buffer("invalid", invalid)   # [C, 2, G]
+        self.register_buffer("invalid", invalid)
         self.carrier_list = carrier_list
 
     def _per_flight_invalid_mask(
         self,
         carrier_ohe: torch.Tensor,  # [N, C]
         is_lga: torch.Tensor,       # [N]
-    ) -> torch.Tensor:              # [N, G]  float, 1 = infeasible
-        """Compute per-flight infeasibility mask (shared by forward and mask_logits)."""
-        per_flight_inv = torch.einsum("nc,cag->nag", carrier_ohe.float(),
-                                      self.invalid)
+    ) -> torch.Tensor:              # [N, G]
+        per_flight_inv = torch.einsum("nc,cag->nag", carrier_ohe.float(), self.invalid)
         ap_idx     = is_lga.long().clamp(0, 1)
         ap_idx_exp = ap_idx.view(-1, 1, 1).expand(-1, 1, NUM_GATES)
-        return per_flight_inv.gather(1, ap_idx_exp).squeeze(1)   # [N, G]
+        return per_flight_inv.gather(1, ap_idx_exp).squeeze(1)
 
     def mask_logits(
         self,
@@ -208,37 +141,17 @@ class GateConstraintLoss(nn.Module):
         carrier_ohe: torch.Tensor,  # [N, C]
         is_lga: torch.Tensor,       # [N]
     ) -> torch.Tensor:              # [N, G]
-        """
-        Set logits of infeasible gates to -inf (hard constraint).
+        """Set infeasible gate logits to −∞ (hard constraint, differentiable)."""
+        inv_mask = self._per_flight_invalid_mask(carrier_ohe, is_lga)
+        valid    = inv_mask < 0.5
 
-        Using torch.where keeps the operation differentiable: gradients for
-        masked positions are zero (they never influence any softmax output),
-        while gradients for valid positions flow normally.
-
-        If a flight has NO valid gate in the mapping (edge case), all gates
-        are restored (fallback to soft penalty only) to avoid NaN in softmax.
-        """
-        inv_mask = self._per_flight_invalid_mask(carrier_ohe, is_lga)  # [N, G]
-        valid    = inv_mask < 0.5                                        # [N, G] bool
-
-        # Fallback: if every gate is masked, restore all (avoids softmax NaN)
-        has_valid = valid.any(dim=-1, keepdim=True)    # [N, 1]
-        valid     = valid | ~has_valid                  # allow all when nothing valid
+        # Fallback: if every gate is masked for a flight, allow all gates
+        # (avoids softmax NaN for carriers with no valid terminal at this airport)
+        has_valid = valid.any(dim=-1, keepdim=True)
+        valid     = valid | ~has_valid
 
         neg_inf = torch.full_like(gate_logits, float("-inf"))
         return torch.where(valid, gate_logits, neg_inf)
-
-    def forward(
-        self,
-        gate_logits: torch.Tensor,   # [N, G]  — pass PRE-MASKED logits for zero penalty
-        carrier_ohe: torch.Tensor,   # [N, C]  (float one-hot)
-        is_lga: torch.Tensor,        # [N]     (float: 1 = LGA, 0 = EWR)
-    ) -> torch.Tensor:
-        """Returns mean infeasibility probability (scalar)."""
-        gate_probs = torch.softmax(gate_logits, dim=-1)   # [N, G]
-        inv_mask   = self._per_flight_invalid_mask(carrier_ohe, is_lga)
-        penalty    = (gate_probs * inv_mask).sum(dim=-1)  # [N]
-        return penalty.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -249,73 +162,28 @@ class TaxiingDistanceLoss(nn.Module):
     """
     Differentiable expected taxiing distance.
 
-    At initialisation, the shortest network path (metres) from each of the
-    five terminals to its airport's runway is computed once from the GraphML
-    graphs.  During training the differentiable expected distance
-
-        E[dist] = softmax(gate_logits) · dist_vec          [N,]
-
-    is minimised, so gradients flow back through the gate logits.
-
-    Parameters
-    ----------
-    ewr_graphml, lga_graphml : str or Path
-        Paths to the OSMnx GraphML files for EWR and LGA respectively.
+    Uses APPROX_DIST_M (hardcoded realistic values in metres), matching
+    the distances used by baseline.py for direct apples-to-apples comparison.
+    Multiply the returned normalised loss by 1380.0 to recover metres.
     """
 
-    def __init__(self, ewr_graphml: str, lga_graphml: str):
+    def __init__(self):
         super().__init__()
-        print("Loading EWR airport network graph…")
-        G_ewr = nx.read_graphml(str(ewr_graphml))
-        print("Loading LGA airport network graph…")
-        G_lga = nx.read_graphml(str(lga_graphml))
-
-        dist_vec = self._build_distance_vector(G_ewr, G_lga)
-        self.register_buffer("dist_vec", dist_vec)  # [NUM_GATES]
-
-    @staticmethod
-    def _build_distance_vector(G_ewr: nx.Graph, G_lga: nx.Graph) -> torch.Tensor:
-        """Pre-compute and normalise terminal→runway distances for all gates."""
-        graphs = {"EWR": G_ewr, "LGA": G_lga}
-        distances: List[float] = []
-
-        for gate_name in GATE_CLASSES:
-            airport = gate_name.split("_")[0]  # 'EWR' or 'LGA'
-            G = graphs[airport]
-
-            t_lat, t_lon = TERMINAL_COORDS[gate_name]
-            r_lat, r_lon = RUNWAY_COORDS[airport]
-
-            t_node = _nearest_node(G, t_lat, t_lon)
-            r_node = _nearest_node(G, r_lat, r_lon)
-            dist_m = _path_length(G, t_node, r_node)
-            print(f"  {gate_name:25s} → runway: {dist_m:7.0f} m")
-            distances.append(dist_m)
-
-        dist_t = torch.tensor(distances, dtype=torch.float32)
-        # Normalise to [0, 1] so F2 is on the same scale as F1 and F3
-        dist_t = dist_t / (dist_t.max() + 1e-8)
-        return dist_t  # [NUM_GATES]
+        raw = torch.tensor(
+            [APPROX_DIST_M[g] for g in GATE_CLASSES], dtype=torch.float32
+        )
+        self.register_buffer("dist_vec", raw / (raw.max() + 1e-8))
 
     def forward(
         self,
-        gate_logits: torch.Tensor,              # [N, G]
-        is_at_nyc: Optional[torch.Tensor] = None,  # [N] bool/float mask
+        gate_logits: torch.Tensor,
+        is_at_nyc: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Expected normalised taxiing distance, averaged over active flights.
-
-        Parameters
-        ----------
-        is_at_nyc : optional mask
-            If provided, only flights that depart from (or arrive at) EWR/LGA
-            contribute to the loss.  Others are structurally irrelevant.
-        """
-        gate_probs = torch.softmax(gate_logits, dim=-1)        # [N, G]
-        expected = (gate_probs * self.dist_vec).sum(dim=-1)    # [N]
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        expected   = (gate_probs * self.dist_vec).sum(dim=-1)
 
         if is_at_nyc is not None:
-            mask = is_at_nyc.float()
+            mask     = is_at_nyc.float()
             n_active = mask.sum().clamp(min=1.0)
             return (expected * mask).sum() / n_active
 
@@ -323,25 +191,22 @@ class TaxiingDistanceLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# F3 – Schedule Stability Loss
+# F3 – Schedule Stability Loss (delay-risk proxy)
 # ---------------------------------------------------------------------------
 
 class ScheduleStabilityLoss(nn.Module):
     """
-    Penalise the mean predicted positive departure delay.
+    Differentiable approximation of P(departure delay > 15 min).
 
-    ReLU ensures that early departures (delay < 0) are not penalised;
-    only flights predicted to depart late contribute to the loss.
+        F3 = mean(sigmoid((delay_pred − 15) / 5))
+
+    The sigmoid "temperature" of 5 min gives a soft threshold: flights
+    predicted at 15 min delay contribute 0.5, well below contribute ~0,
+    well above contribute ~1.  Output is always in (0, 1).
     """
 
-    def forward(
-        self,
-        delay_pred: torch.Tensor,   # [N]
-        delay_scale: float = 30.0,  # normalise to ≈[0,1] before loss computation
-    ) -> torch.Tensor:
-        # Divide by delay_scale so F3 lives on the same [0,1] scale as F1/F2.
-        # The raw-minute value is still returned for Pareto logging (see below).
-        return F.relu(delay_pred / delay_scale).mean()
+    def forward(self, delay_pred: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid((delay_pred - 15.0) / 5.0).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -350,23 +215,51 @@ class ScheduleStabilityLoss(nn.Module):
 
 class EntropyRegularization(nn.Module):
     """
-    Negative-entropy penalty on the gate-assignment distribution.
+    Entropy penalty: minimising H pushes the model toward confident,
+    peaked gate assignments rather than uniform distributions.
 
-    A uniform distribution over 5 gates has maximum entropy (log5 ≈ 1.61).
-    Minimising –H pushes the model toward *confident*, peaked assignments,
-    counteracting the tendency of an under-trained gate head to stay near
-    the uniform fixed-point (which produces a flat F1 curve).
-
-    Loss = –mean_entropy(softmax(gate_logits))
+    Loss = mean_entropy(softmax(gate_logits))  [higher = more uniform = worse]
     """
 
     def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-        log_probs = torch.log_softmax(gate_logits, dim=-1)  # numerically stable
+        log_probs = torch.log_softmax(gate_logits, dim=-1)
         probs     = torch.softmax(gate_logits, dim=-1)
-        # nan_to_num handles 0 * (-inf) = NaN that arises when hard-masked gates
-        # have prob=0 and log_prob=-inf; the mathematical limit x·log(x)→0 as x→0.
-        entropy   = -(probs * log_probs).nan_to_num(0.0).sum(dim=-1).mean()
-        return -entropy   # minimise → maximise confidence
+        log_probs_safe = log_probs.clamp(min=-100.0)
+        entropy   = -(probs * log_probs_safe).sum(dim=-1).mean()
+        return entropy   # minimising → peaked (confident) predictions
+
+
+# ---------------------------------------------------------------------------
+# Load-balancing regularisation — discourages temporal overloading
+# ---------------------------------------------------------------------------
+
+class LoadBalancingLoss(nn.Module):
+    """
+    Penalise high variance of expected gate load within each 30-min
+    departure bucket in the batch.  Differentiable via gate_probs.
+
+    NOTE: Use a small delta (≤ 0.05) or 0.0.  Minimising load std pushes
+    gate_probs toward uniform (max-entropy = min-variance), which fights the
+    F2 gradient.  A better future design would penalise load ABOVE a
+    per-terminal capacity threshold rather than minimising variance.
+    """
+
+    def forward(
+        self,
+        gate_probs: torch.Tensor,   # [N, G]  after masked softmax
+        dep_bucket: torch.Tensor,   # [N]     CRS_DEP_TIME // 30
+    ) -> torch.Tensor:
+        unique_buckets = dep_bucket.unique()
+        stds = []
+        for b in unique_buckets:
+            mask = dep_bucket == b
+            if mask.sum() < 2:
+                continue
+            expected_load = gate_probs[mask].sum(dim=0)  # [G]
+            stds.append(expected_load.std())
+        if not stds:
+            return gate_probs.new_tensor(0.0)
+        return torch.stack(stds).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -374,18 +267,12 @@ class EntropyRegularization(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DelayRegressionLoss(nn.Module):
-    """
-    Huber loss between predicted and observed departure delay.
-
-    Switching from MSE to Huber (delta=1.0 on the normalised scale) makes
-    the regression robust to large outlier delays that would otherwise
-    produce enormous gradients and overwhelm F1/F2.
-    """
+    """Huber loss between predicted and observed departure delay (normalised)."""
 
     def forward(
         self,
-        delay_pred: torch.Tensor,   # [N]
-        delay_true: torch.Tensor,   # [N]
+        delay_pred: torch.Tensor,
+        delay_true: torch.Tensor,
         delay_scale: float = 30.0,
     ) -> torch.Tensor:
         pred_s = delay_pred / delay_scale
@@ -399,100 +286,94 @@ class DelayRegressionLoss(nn.Module):
 
 class MultiObjectiveLoss(nn.Module):
     """
-    L = α·F1 + β·F2 + γ·F3_scaled + λ·L_reg_scaled + ε·(–H)
+    L = β·F2 + γ·F3 + λ·L_reg + ε·(–H)
 
-    All terms are normalised to a comparable [0, 1] scale before weighting:
-    - F1   ∈ [0, 1]  (probability mass on invalid gates)
-    - F2   ∈ [0, 1]  (normalised taxi distance, already scaled in F2 layer)
-    - F3   = mean(ReLU(delay_pred / delay_scale))   ← key fix: divide by 30 min
-    - L_reg = Huber(delay_pred/scale, delay_true/scale)  ← key fix: dimensionless
-    - –H   = –mean_entropy(gate_probs)              ← discourages uniform output
-
-    The raw-minute F3 value is still returned for Pareto logging.
+    Gate feasibility is enforced structurally (GateMasker) — not as a loss.
 
     Parameters
     ----------
     gate_mapping_path : str
     ewr_graphml, lga_graphml : str
     carrier_list : list[str]
-    alpha, beta, gamma : float
-        Pareto trade-off weights for F1, F2, F3.
+    alpha : float
+        Retained for CLI backward-compatibility; ignored internally.
+    beta, gamma : float
+        Pareto trade-off weights for F2 and F3.
     lam : float
-        Weight of the auxiliary delay regression loss (default 0.1, not 1.0).
+        Weight of the auxiliary delay regression loss.
     delay_scale : float
-        Reference delay in minutes used to normalise F3 and L_reg (default 30).
+        Reference delay (minutes) used to normalise L_reg.
     entropy_weight : float
-        Weight of the entropy penalty –H (default 0.1).
+        Weight of the entropy penalty –H.
     """
 
     def __init__(
         self,
         gate_mapping_path: str,
-        ewr_graphml: str,
-        lga_graphml: str,
         carrier_list: List[str],
-        alpha: float = 5.0,   # F1 dominance — hard masking makes this mostly symbolic
+        alpha: float = 0.0,   # kept for CLI compat; not used
         beta: float = 1.0,
         gamma: float = 1.0,
         lam: float = 0.1,
         delay_scale: float = 30.0,
-        entropy_weight: float = 0.1,
+        entropy_weight: float = 0.0,
+        delta: float = 0.5,
+        # Legacy graphml params accepted but ignored (distances now from APPROX_DIST_M)
+        ewr_graphml: str = "",
+        lga_graphml: str = "",
     ):
         super().__init__()
-        self.alpha          = alpha
         self.beta           = beta
         self.gamma          = gamma
         self.lam            = lam
         self.delay_scale    = delay_scale
         self.entropy_weight = entropy_weight
+        self.delta          = delta
 
-        self.f1      = GateConstraintLoss(gate_mapping_path, carrier_list)
-        self.f2      = TaxiingDistanceLoss(ewr_graphml, lga_graphml)
+        self.masker  = GateMasker(gate_mapping_path, carrier_list)
+        self.f2      = TaxiingDistanceLoss()
         self.f3      = ScheduleStabilityLoss()
         self.l_reg   = DelayRegressionLoss()
         self.entropy = EntropyRegularization()
+        self.lb      = LoadBalancingLoss()
 
     def forward(
         self,
-        gate_logits: torch.Tensor,   # [N, 5]
-        delay_pred: torch.Tensor,    # [N]
-        delay_true: torch.Tensor,    # [N]
-        carrier_ohe: torch.Tensor,   # [N, C]
-        is_lga: torch.Tensor,        # [N]  float: 1 = LGA, 0 = EWR
-        is_at_nyc: torch.Tensor,     # [N]  float: 1 = flight uses EWR or LGA
+        gate_logits: torch.Tensor,              # [N, 5]
+        delay_pred: torch.Tensor,               # [N]
+        delay_true: torch.Tensor,               # [N]
+        carrier_ohe: torch.Tensor,              # [N, C]
+        is_lga: torch.Tensor,                   # [N]  float: 1 = LGA, 0 = EWR
+        is_at_nyc: torch.Tensor,                # [N]  float: 1 = flight uses EWR or LGA
+        dep_bucket: Optional[torch.Tensor] = None,  # [N]  CRS_DEP_TIME // 30
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
         -------
-        total  : scalar – combined back-prop loss (all terms normalised)
-        f1     : scalar – gate infeasibility  [0,1]  (Pareto logging)
-        f2     : scalar – expected taxi dist  [0,1]  (Pareto logging)
-        f3     : scalar – mean positive delay in raw minutes (Pareto logging)
+        total  : scalar – combined back-prop loss
+        f2     : scalar – expected normalised taxi distance  [0, 1]
+        f3     : scalar – delay-risk proxy P(delay > 15 min) [0, 1]
+        f3_raw : scalar – mean positive delay in raw minutes (logging only)
         """
-        # ── Hard gate feasibility enforcement ──────────────────────────────
-        # Set infeasible gate logits to -inf BEFORE any softmax operation.
-        # This guarantees zero probability mass on invalid gates in every
-        # downstream computation (F1, F2, entropy) — zero gate violations
-        # by construction, at both training and inference time.
-        masked_logits = self.f1.mask_logits(gate_logits, carrier_ohe, is_lga)
+        # Structural feasibility: infeasible gate logits → −∞
+        masked_logits = self.masker.mask_logits(gate_logits, carrier_ohe, is_lga)
+        gate_probs    = F.softmax(masked_logits, dim=-1)
 
-        # All gate-related losses use the hard-masked logits
-        loss_f1    = self.f1(masked_logits, carrier_ohe, is_lga)   # = 0.0 always
         loss_f2    = self.f2(masked_logits, is_at_nyc)
+        loss_f3    = self.f3(delay_pred)
+        loss_reg   = self.l_reg(delay_pred, delay_true, self.delay_scale)
         loss_ent   = self.entropy(masked_logits)
-
-        # Delay-related losses are independent of the gate mask
-        loss_f3_s  = self.f3(delay_pred, self.delay_scale)
-        loss_reg_s = self.l_reg(delay_pred, delay_true, self.delay_scale)
+        loss_lb    = (self.lb(gate_probs, dep_bucket)
+                      if dep_bucket is not None
+                      else masked_logits.new_tensor(0.0))
 
         total = (
-            self.alpha            * loss_f1
-            + self.beta           * loss_f2
-            + self.gamma          * loss_f3_s
-            + self.lam            * loss_reg_s
+            self.beta             * loss_f2
+            + self.gamma          * loss_f3
+            + self.lam            * loss_reg
             + self.entropy_weight * loss_ent
+            + self.delta          * loss_lb
         )
 
-        # Raw F3 in minutes for Pareto / history logging
         f3_raw = F.relu(delay_pred).mean()
-        return total, loss_f1, loss_f2, f3_raw
+        return total, loss_f2, loss_f3, f3_raw

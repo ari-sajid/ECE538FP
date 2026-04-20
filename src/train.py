@@ -37,6 +37,7 @@ epochs are written to  outputs/pareto_front.csv.
 """
 
 import argparse
+import platform
 import sys
 import warnings
 from pathlib import Path
@@ -69,8 +70,10 @@ NODE_CSV = DATA_DIR / "processed" / "final_node_features.csv"
 EDGE_CSV = DATA_DIR / "processed" / "edges.csv"
 RAW_CSV  = DATA_DIR / "raw"       / "nyc_master_2025.csv"
 GATE_MAP = DATA_DIR / "meta"      / "gate_mapping.json"
-EWR_GML  = DATA_DIR / "geo"       / "ewr_layout.graphml"
-LGA_GML  = DATA_DIR / "geo"       / "lga_layout.graphml"
+
+# Max taxi distance in metres (= APPROX_DIST_M["EWR_Terminal_C"]).
+# Multiply normalised F2 by this to get actual metres for reporting.
+F2_MAX_DIST_M = 1380.0
 
 # ---------------------------------------------------------------------------
 # Default hyper-parameters (all overridable via CLI)
@@ -86,6 +89,7 @@ DEFAULTS = dict(
     batch_size       = 512,
     num_neighbors_l1 = 10,
     num_neighbors_l2 = 5,
+    num_neighbors_l3 = 5,   # must match num_layers=3
     window_hours     = 4,
     # Loss weights — F1 is enforced by hard masking (always 0); alpha is symbolic
     alpha            = 5.0,  # F1 weight (infeasible logits masked to -inf first)
@@ -93,7 +97,8 @@ DEFAULTS = dict(
     gamma            = 1.0,  # F3 (schedule stability, now normalised)
     lam              = 0.1,  # L_reg (delay regression) — reduced from 1.0
     delay_scale      = 30.0, # divide delay by this to normalise F3 / L_reg
-    entropy_weight   = 0.1,  # –H entropy penalty (prevents uniform gate head)
+    entropy_weight   = 0.0,  # entropy penalty (0 = off; sign fixed so >0 encourages peaked predictions)
+    delta            = 0.0,  # F4 load-balancing weight (disabled: variance minimization conflicts with F2)
     patience         = 15,   # early-stopping patience (val epochs without improvement)
     device           = "cuda" if torch.cuda.is_available() else "cpu",
 )
@@ -158,7 +163,7 @@ def pareto_front_indices(points):
 # ---------------------------------------------------------------------------
 
 def _check_files():
-    missing = [p for p in (NODE_CSV, EDGE_CSV, RAW_CSV, GATE_MAP, EWR_GML, LGA_GML)
+    missing = [p for p in (NODE_CSV, EDGE_CSV, RAW_CSV, GATE_MAP)
                if not p.exists()]
     if missing:
         print("\nMissing required files:")
@@ -235,6 +240,9 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     feature_cols = [c for c in df.columns if c not in skip]
 
     feat_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+    # Replace ±inf before computing means — fillna only touches NaN, not inf,
+    # so any inf value would make col_means=inf → scaler produces NaN everywhere.
+    feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
     col_means = feat_df.mean()
     feat_df = feat_df.fillna(col_means).fillna(0.0)
     x_raw = feat_df.values.astype(np.float32)                   # [N, F]
@@ -246,6 +254,8 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     scaler = StandardScaler()
     scaler.fit(x_raw[train_mask])
     x = scaler.transform(x_raw).astype(np.float32)
+    # Safety net: clip any residual NaN/inf that survived standardisation.
+    x = np.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
     print(f"  Features standardised on {train_mask.sum():,} training rows.")
 
     carrier_ohe = df[carrier_cols].astype(np.float32).values    # [N, C]
@@ -277,25 +287,30 @@ def load_node_features(node_csv: Path, raw_csv: Path):
 
 def load_edges(edge_csv: Path):
     """
-    Load edges.csv and split into turnaround / congestion edge_index tensors.
+    Load edges.csv and return edge_index tensors for all three edge types.
 
     Returns
     -------
-    turnaround_ei : LongTensor [2, E_t]
-    congestion_ei : LongTensor [2, E_c]
+    turnaround_ei    : LongTensor [2, E_t]
+    congestion_ei    : LongTensor [2, E_c]
+    same_terminal_ei : LongTensor [2, E_s]  (empty tensor if not in CSV)
     """
     print(f"Loading edges ({edge_csv.name})…")
     edges = pd.read_csv(edge_csv, low_memory=False)
 
     ta = edges[edges["type"] == "turnaround"][["source", "target"]].values.T
     cg = edges[edges["type"] == "congestion"][["source", "target"]].values.T
+    st_rows = edges[edges["type"] == "same_terminal"][["source", "target"]]
+    st = st_rows.values.T if len(st_rows) else np.zeros((2, 0), dtype=np.int64)
 
-    turnaround_ei = torch.from_numpy(ta.astype(np.int64))
-    congestion_ei = torch.from_numpy(cg.astype(np.int64))
+    turnaround_ei    = torch.from_numpy(ta.astype(np.int64))
+    congestion_ei    = torch.from_numpy(cg.astype(np.int64))
+    same_terminal_ei = torch.from_numpy(st.astype(np.int64))
 
-    print(f"  Turnaround edges  : {turnaround_ei.shape[1]:,}")
-    print(f"  Congestion edges  : {congestion_ei.shape[1]:,}")
-    return turnaround_ei, congestion_ei
+    print(f"  Turnaround edges    : {turnaround_ei.shape[1]:,}")
+    print(f"  Congestion edges    : {congestion_ei.shape[1]:,}")
+    print(f"  Same-terminal edges : {same_terminal_ei.shape[1]:,}")
+    return turnaround_ei, congestion_ei, same_terminal_ei
 
 
 def build_hetero_data(
@@ -303,16 +318,20 @@ def build_hetero_data(
     delay: torch.Tensor,
     turnaround_ei: torch.Tensor,
     congestion_ei: torch.Tensor,
+    same_terminal_ei: torch.Tensor,
+    crs_dep_times: np.ndarray,
 ) -> HeteroData:
     """Assemble a PyG HeteroData object from the processed arrays."""
     data = HeteroData()
 
-    data["flight"].x         = x        # [N, F]
-    data["flight"].y_delay   = delay    # [N]
-    data["flight"].num_nodes = x.size(0)
+    data["flight"].x          = x
+    data["flight"].y_delay    = delay
+    data["flight"].num_nodes  = x.size(0)
+    data["flight"].dep_bucket = torch.from_numpy((crs_dep_times // 30).astype(np.int64))
 
-    data["flight", "turnaround", "flight"].edge_index = turnaround_ei
-    data["flight", "congestion", "flight"].edge_index  = congestion_ei
+    data["flight", "turnaround",    "flight"].edge_index = turnaround_ei
+    data["flight", "congestion",    "flight"].edge_index = congestion_ei
+    data["flight", "same_terminal", "flight"].edge_index = same_terminal_ei
 
     return data
 
@@ -324,46 +343,49 @@ def build_hetero_data(
 def train_epoch(model, loader, optimizer, criterion, device,
                 carrier_ohe_all, is_lga_all, is_at_nyc_all):
     model.train()
-    totals = {"loss": 0.0, "f1": 0.0, "f2": 0.0, "f3": 0.0}
+    totals = {"loss": 0.0, "f2": 0.0, "f3": 0.0, "f3_raw": 0.0}
     n_batches = 0
 
     for batch in loader:
         batch = batch.to(device)
 
-        # Global indices of seed nodes in this mini-batch
-        seed_ids = batch["flight"].input_id   # [B]
-        n_seed   = seed_ids.size(0)
+        n_seed   = batch["flight"].input_id.size(0)
+        # n_id gives global graph node IDs for all subgraph nodes;
+        # first n_seed entries are the seed nodes' global indices.
+        global_ids = batch["flight"].n_id[:n_seed]
 
         gate_logits, delay_pred = model(
             {"flight": batch["flight"].x},
             batch.edge_index_dict,
         )
 
-        # Restrict outputs and targets to seed nodes only
         gate_logits_s = gate_logits[:n_seed]
         delay_pred_s  = delay_pred[:n_seed]
         delay_true_s  = batch["flight"].y_delay[:n_seed].to(device)
+        dep_bucket    = batch["flight"].dep_bucket[:n_seed].to(device)
 
-        # Per-flight metadata (loaded from CPU, indexed by global seed IDs)
-        c_ohe = carrier_ohe_all[seed_ids].to(device)
-        lga   = is_lga_all[seed_ids].to(device)
-        nyc   = is_at_nyc_all[seed_ids].to(device)
+        c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
+        lga   = is_lga_all[global_ids.cpu()].to(device)
+        nyc   = is_at_nyc_all[global_ids.cpu()].to(device)
 
-        loss, f1, f2, f3 = criterion(
+        loss, f2, f3, f3_raw = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
-            c_ohe, lga, nyc,
+            c_ohe, lga, nyc, dep_bucket,
         )
+
+        if not torch.isfinite(loss):
+            continue
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += loss.item()
-        totals["f1"]   += f1.item()
-        totals["f2"]   += f2.item()
-        totals["f3"]   += f3.item()
-        n_batches      += 1
+        totals["loss"]   += loss.item()
+        totals["f2"]     += f2.item()
+        totals["f3"]     += f3.item()
+        totals["f3_raw"] += f3_raw.item()
+        n_batches        += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
@@ -376,14 +398,14 @@ def train_epoch(model, loader, optimizer, criterion, device,
 def eval_epoch(model, loader, criterion, device,
                carrier_ohe_all, is_lga_all, is_at_nyc_all):
     model.eval()
-    totals = {"loss": 0.0, "f1": 0.0, "f2": 0.0, "f3": 0.0}
+    totals = {"loss": 0.0, "f2": 0.0, "f3": 0.0, "f3_raw": 0.0}
     n_batches = 0
 
     for batch in loader:
         batch = batch.to(device)
 
-        seed_ids = batch["flight"].input_id
-        n_seed   = seed_ids.size(0)
+        n_seed     = batch["flight"].input_id.size(0)
+        global_ids = batch["flight"].n_id[:n_seed]
 
         gate_logits, delay_pred = model(
             {"flight": batch["flight"].x},
@@ -393,23 +415,68 @@ def eval_epoch(model, loader, criterion, device,
         gate_logits_s = gate_logits[:n_seed]
         delay_pred_s  = delay_pred[:n_seed]
         delay_true_s  = batch["flight"].y_delay[:n_seed].to(device)
+        dep_bucket    = batch["flight"].dep_bucket[:n_seed].to(device)
 
-        c_ohe = carrier_ohe_all[seed_ids].to(device)
-        lga   = is_lga_all[seed_ids].to(device)
-        nyc   = is_at_nyc_all[seed_ids].to(device)
+        c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
+        lga   = is_lga_all[global_ids.cpu()].to(device)
+        nyc   = is_at_nyc_all[global_ids.cpu()].to(device)
 
-        loss, f1, f2, f3 = criterion(
+        loss, f2, f3, f3_raw = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
-            c_ohe, lga, nyc,
+            c_ohe, lga, nyc, dep_bucket,
         )
 
-        totals["loss"] += loss.item()
-        totals["f1"]   += f1.item()
-        totals["f2"]   += f2.item()
-        totals["f3"]   += f3.item()
-        n_batches      += 1
+        if not torch.isfinite(loss):
+            continue
+
+        totals["loss"]   += loss.item()
+        totals["f2"]     += f2.item()
+        totals["f3"]     += f3.item()
+        totals["f3_raw"] += f3_raw.item()
+        n_batches        += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
+
+
+# ---------------------------------------------------------------------------
+# Inference pass — collect gate probabilities for all seed nodes
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def inference_pass(model, loader, criterion, device, carrier_ohe_all, is_lga_all):
+    """
+    Run the trained model over a loader and return gate probabilities
+    (after GateMasker) and the corresponding local input indices.
+
+    Returns
+    -------
+    gate_probs_np : ndarray[float32, (N, NUM_GATES)]
+    local_ids_np  : ndarray[int64,   (N,)]  — index within loader's input_nodes set
+    """
+    model.eval()
+    all_probs, all_ids = [], []
+
+    for batch in loader:
+        batch      = batch.to(device)
+        local_ids  = batch["flight"].input_id          # position within input_nodes
+        n_seed     = local_ids.size(0)
+        global_ids = batch["flight"].n_id[:n_seed]     # global graph node IDs
+
+        gate_logits, _ = model(
+            {"flight": batch["flight"].x},
+            batch.edge_index_dict,
+        )
+        gate_logits_s = gate_logits[:n_seed]
+        c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
+        lga   = is_lga_all[global_ids.cpu()].to(device)
+
+        masked = criterion.masker.mask_logits(gate_logits_s, c_ohe, lga)
+        probs  = torch.softmax(masked, dim=-1)
+
+        all_probs.append(probs.cpu().numpy())
+        all_ids.append(local_ids.cpu().numpy())
+
+    return np.concatenate(all_probs), np.concatenate(all_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +513,9 @@ def main():
      train_mask, val_mask, test_mask, carrier_list, origin_list,
      feature_cols, crs_dep_times, fl_months) = load_node_features(NODE_CSV, RAW_CSV)
 
-    turnaround_ei, congestion_ei = load_edges(EDGE_CSV)
-    data = build_hetero_data(x, delay, turnaround_ei, congestion_ei)
+    turnaround_ei, congestion_ei, same_terminal_ei = load_edges(EDGE_CSV)
+    data = build_hetero_data(x, delay, turnaround_ei, congestion_ei, same_terminal_ei,
+                             crs_dep_times)
 
     N     = x.size(0)
     F_in  = x.size(1)
@@ -467,17 +535,23 @@ def main():
           f"dep={crs_dep_times[train_ids_sorted[0].item()]:04d}\n")
 
     # ── Build NeighborLoaders ─────────────────────────────────────────────
-    num_nbrs = [args.num_neighbors_l1, args.num_neighbors_l2]
+    num_nbrs = [args.num_neighbors_l1, args.num_neighbors_l2, args.num_neighbors_l3]
     edge_types = [
-        ("flight", "turnaround", "flight"),
-        ("flight", "congestion",  "flight"),
+        ("flight", "turnaround",    "flight"),
+        ("flight", "congestion",    "flight"),
+        ("flight", "same_terminal", "flight"),
     ]
+    # Windows spawns fresh processes per worker, each loading the full CUDA stack
+    # into the page file.  With persistent_workers=True, all three loaders keep
+    # their workers alive simultaneously (6 processes), which exhausts the page
+    # file.  Use num_workers=0 on Windows so no subprocesses are spawned.
+    _n_workers  = 0 if platform.system() == "Windows" else 2
     shared_loader_kwargs = dict(
-        data           = data,
-        num_neighbors  = {et: num_nbrs for et in edge_types},
-        batch_size     = args.batch_size,
-        num_workers    = 2,
-        persistent_workers = True,
+        data               = data,
+        num_neighbors      = {et: num_nbrs for et in edge_types},
+        batch_size         = args.batch_size,
+        num_workers        = _n_workers,
+        persistent_workers = _n_workers > 0,
     )
     train_loader = NeighborLoader(
         input_nodes=("flight", train_ids_sorted), shuffle=False,
@@ -522,8 +596,6 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────
     criterion = MultiObjectiveLoss(
         gate_mapping_path = str(GATE_MAP),
-        ewr_graphml       = str(EWR_GML),
-        lga_graphml       = str(LGA_GML),
         carrier_list      = carrier_list,
         alpha             = args.alpha,
         beta              = args.beta,
@@ -531,15 +603,41 @@ def main():
         lam               = args.lam,
         delay_scale       = args.delay_scale,
         entropy_weight    = args.entropy_weight,
+        delta             = args.delta,
     ).to(device)
 
+    # ── Save epoch-0 checkpoint so best_model.pt always exists ─────────────
+    import json as _json
+    _schema = {
+        "in_channels"    : F_in,
+        "carrier_list"   : carrier_list,
+        "origin_list"    : origin_list,
+        "feature_cols"   : feature_cols,
+        "num_heads"      : args.num_heads,
+        "hidden_channels": args.hidden_channels,
+        "num_layers"     : args.num_layers,
+    }
+    torch.save(
+        {
+            "epoch"        : 0,
+            "model_state"  : model.state_dict(),
+            "in_channels"  : F_in,
+            "carrier_list" : carrier_list,
+            "origin_list"  : origin_list,
+            "feature_cols" : feature_cols,
+            "args"         : vars(args),
+        },
+        OUT_DIR / "best_model.pt",
+    )
+    with open(OUT_DIR / "feature_schema.json", "w") as _fh:
+        _json.dump(_schema, _fh, indent=2)
+
     # ── Training loop with early stopping on val loss ─────────────────────
-    print("\n" + "=" * 100)
-    print("Gate feasibility: HARD MASK active — infeasible logits forced to -inf "
-          "→ F1 = 0.0000 guaranteed every epoch")
-    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-F1':>7}  {'Tr-F2':>7}  {'Tr-F3':>7}"
-          f"  {'VaLoss':>8}  {'Va-F1':>7}  {'Va-F2':>7}  {'Va-F3':>7}  {'*':>2}")
-    print("=" * 100)
+    print("\n" + "=" * 84)
+    print("Constrained GNN Scheduler  |  gate masking enforced structurally (not as loss)")
+    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-F2':>7}  {'Tr-F3':>7}"
+          f"  {'VaLoss':>8}  {'Va-F2':>7}  {'Va-F3':>7}  {'*':>2}")
+    print("=" * 84)
 
     history         = []
     best_val_loss   = float("inf")
@@ -553,11 +651,10 @@ def main():
         scheduler.step()
 
         improved = va["loss"] < best_val_loss
-        marker   = "✓" if improved else ""
+        marker   = "*" if improved else ""
         if improved:
             best_val_loss = va["loss"]
             no_improve    = 0
-            import json as _json
             torch.save(
                 {
                     "epoch"        : epoch,
@@ -584,14 +681,14 @@ def main():
         else:
             no_improve += 1
 
+        # history: (epoch, tr_f2, tr_f3, tr_f3_raw, va_f2, va_f3, va_f3_raw)
         row = (epoch,
-               tr["f1"], tr["f2"], tr["f3"],
-               va["f1"], va["f2"], va["f3"])
+               tr["f2"], tr["f3"], tr["f3_raw"],
+               va["f2"], va["f3"], va["f3_raw"])
         history.append(row)
 
-        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['f1']:7.4f}  {tr['f2']:7.4f}  "
-              f"{tr['f3']:7.2f}  {va['loss']:8.4f}  {va['f1']:7.4f}  {va['f2']:7.4f}  "
-              f"{va['f3']:7.2f}  {marker}")
+        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['f2']:7.4f}  {tr['f3']:7.4f}"
+              f"  {va['loss']:8.4f}  {va['f2']:7.4f}  {va['f3']:7.4f}  {marker}")
 
         if no_improve >= args.patience:
             print(f"\nEarly stopping at epoch {epoch} "
@@ -604,36 +701,131 @@ def main():
     te = eval_epoch(model, test_loader, criterion, device,
                     carrier_ohe, is_lga, is_at_nyc)
     print(f"\nTest  (best ckpt epoch {best_ckpt['epoch']}):"
-          f"  F1={te['f1']:.4f}  F2={te['f2']:.4f}  F3={te['f3']:.2f} min")
+          f"  F2={te['f2']:.4f} ({te['f2'] * F2_MAX_DIST_M:.0f} m)"
+          f"  F3={te['f3']:.4f}  mean-pos-delay={te['f3_raw']:.1f} min")
 
-    # ── Pareto front analysis (on val objectives — no test leakage) ───────
-    val_pts  = [(r[4], r[5], r[6]) for r in history]
+    # ── Pareto front — 2 objectives: F2 (taxi) and F3 (delay risk) ────────
+    val_pts   = [(r[4], r[5]) for r in history]   # (va_f2, va_f3)
     front_idx = pareto_front_indices(val_pts)
 
     pareto_rows = [
         {"epoch": history[i][0],
-         "val_F1": history[i][4], "val_F2": history[i][5], "val_F3": history[i][6]}
+         "val_F2": history[i][4], "val_F3": history[i][5]}
         for i in front_idx
     ]
-    pareto_df = pd.DataFrame(pareto_rows).sort_values("val_F1")
+    pareto_df = pd.DataFrame(pareto_rows).sort_values("val_F2")
     pareto_df.to_csv(OUT_DIR / "pareto_front.csv", index=False)
-    print("\nPareto-optimal epochs (val set):")
+    print("\nPareto-optimal epochs (val set, lower F2 and F3 is better):")
     print(pareto_df.to_string(index=False))
 
-    # Save full epoch history (train + val; test row appended separately)
+    # Save full epoch history
     hist_df = pd.DataFrame(
         history,
-        columns=["epoch", "train_F1", "train_F2", "train_F3",
-                 "val_F1",   "val_F2",   "val_F3"],
+        columns=["epoch",
+                 "train_F2", "train_F3", "train_F3_raw",
+                 "val_F2",   "val_F3",   "val_F3_raw"],
     )
     hist_df.to_csv(OUT_DIR / "training_history.csv", index=False)
 
     # Save test metrics to a separate file for clean reporting
     test_row = pd.DataFrame([{
-        "best_epoch": best_ckpt["epoch"],
-        "test_F1": te["f1"], "test_F2": te["f2"], "test_F3": te["f3"],
+        "best_epoch"         : best_ckpt["epoch"],
+        "test_F2"            : te["f2"],
+        "test_F3_delay_risk" : te["f3"],
+        "test_F3_raw_min"    : te["f3_raw"],
     }])
     test_row.to_csv(OUT_DIR / "test_metrics.csv", index=False)
+
+    # ── Safe Override policy comparison on test set ───────────────────────
+    from src.safe_override import SafeOverridePolicy   # noqa: E402
+    from src.baseline import GreedyFirstFit            # noqa: E402
+    from src.baselines import GreedyBalanced           # noqa: E402
+
+    print("\nRunning Safe Override policy comparison on test set...")
+
+    # Load raw CSV for carrier / airport / dep_time columns
+    raw_df = pd.read_csv(RAW_CSV, low_memory=False)
+    raw_df["FL_DATE"] = pd.to_datetime(raw_df["FL_DATE"])
+    test_df = raw_df[raw_df["FL_DATE"].dt.month > 10].reset_index(drop=True)
+
+    # Baseline assignments + metrics
+    base_policy  = GreedyFirstFit(str(GATE_MAP))
+    base_assigns = base_policy.assign(test_df)
+    base_metrics = base_policy.score(base_assigns, test_df)
+
+    # GreedyBalanced — more realistic heuristic baseline
+    bal_policy   = GreedyBalanced(str(GATE_MAP))
+    bal_assigns  = bal_policy.assign(test_df)
+    bal_metrics  = bal_policy.score(bal_assigns, test_df)
+
+    # Real GNN gate probabilities via inference
+    gate_probs_np, seed_ids_np = inference_pass(
+        model, test_loader, criterion, device, carrier_ohe, is_lga
+    )
+
+    # local_ids are positions within test_ids (= row index in test_df, since
+    # test_ids[r] is the global node for test_df row r).
+    ordered_probs = np.full((len(test_df), NUM_GATES), 1.0 / NUM_GATES, dtype=np.float32)
+    for i, local_id in enumerate(seed_ids_np):
+        ordered_probs[int(local_id)] = gate_probs_np[i]
+
+    carriers  = test_df["OP_UNIQUE_CARRIER"].values
+    airports  = np.where(test_df["ORIGIN"].isin(["EWR", "LGA"]),
+                         test_df["ORIGIN"].values, None)
+    # Encode date + time-of-day as minutes since epoch so capacity buckets
+    # are per-date (not cumulative across all test days at the same clock time).
+    # FL_DATE is datetime64[us]; divide by 10^6*60 to get minutes since epoch.
+    fl_dates_min = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
+    dep_min_of_day = ((test_df["CRS_DEP_TIME"].values // 100) * 60
+                      + (test_df["CRS_DEP_TIME"].values % 100))
+    dep_times = (fl_dates_min + dep_min_of_day).astype(np.int64)
+
+    # Apply safe override with real model gate probabilities
+    override_policy = SafeOverridePolicy()
+    final_assigns, decision_log, override_stats = override_policy.apply(
+        ordered_probs, base_assigns, carriers, airports, dep_times
+    )
+    override_metrics = base_policy.score(final_assigns, test_df)
+
+    def _pct(new, old):
+        return f"{(new - old) / max(abs(old), 1) * 100:>+7.1f}%"
+
+    # Print comparison table (FirstFit | Balanced | GNN pi*)
+    print(f"\n  {'Metric':<28} {'FirstFit':>10}  {'Balanced':>10}  {'GNN pi*':>10}")
+    print("  " + "-" * 65)
+    bd  = base_metrics["f2_mean_dist_m"]
+    bld = bal_metrics["f2_mean_dist_m"]
+    od  = override_metrics["f2_mean_dist_m"]
+    print(f"  {'F2 mean taxi dist (m)':<28} {bd:>10.1f}  {bld:>10.1f}  {od:>10.1f}  "
+          f"(GNN vs Balanced: {_pct(od, bld)})")
+    bf  = base_metrics["f3_mean_pos_delay_min"]
+    blf = bal_metrics["f3_mean_pos_delay_min"]
+    of  = override_metrics["f3_mean_pos_delay_min"]
+    print(f"  {'F3 mean pos delay (min)':<28} {bf:>10.2f}  {blf:>10.2f}  {of:>10.2f}  "
+          f"(GNN vs Balanced: {_pct(of, blf)})")
+
+    n = override_stats["n_total"]
+    pct_stat = lambda k: f"{100 * override_stats[k] / max(n, 1):.1f}%"
+    print(f"\n  Accepted by GNN          : {override_stats['n_accepted_gnn']:,} ({pct_stat('n_accepted_gnn')})")
+    print(f"  Low confidence (baseline): {override_stats['n_low_confidence']:,} ({pct_stat('n_low_confidence')})")
+    print(f"  Capacity repaired        : {override_stats['n_capacity_repaired']:,}")
+    print(f"  Mean gate confidence     : {override_stats['mean_confidence']:.3f}")
+    print(f"  Conf threshold           : {override_stats['conf_threshold']}")
+
+    # Save outputs
+    decision_log.to_csv(OUT_DIR / "safe_override_decisions.csv", index=False)
+    pd.DataFrame([
+        {"policy": "GreedyFirstFit (pi0)",
+         "f2_mean_dist_m": base_metrics["f2_mean_dist_m"],
+         "f3_mean_pos_delay_min": base_metrics["f3_mean_pos_delay_min"]},
+        {"policy": "GreedyBalanced (alpha=0.5)",
+         "f2_mean_dist_m": bal_metrics["f2_mean_dist_m"],
+         "f3_mean_pos_delay_min": bal_metrics["f3_mean_pos_delay_min"]},
+        {"policy": "GNN Safe Override",
+         "f2_mean_dist_m": override_metrics["f2_mean_dist_m"],
+         "f3_mean_pos_delay_min": override_metrics["f3_mean_pos_delay_min"]},
+    ]).to_csv(OUT_DIR / "policy_comparison.csv", index=False)
+
     print(f"\nOutputs written to {OUT_DIR}/")
 
 

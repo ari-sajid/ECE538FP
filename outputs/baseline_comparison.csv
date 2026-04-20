@@ -1,0 +1,5 @@
+policy,f2_mean_dist_m,f3_delay_risk_pct,utilisation_cv,pct_changed_vs_first_valid
+GreedyFirstValid  (pi0),764.3,22.48,0.9887,0.0
+GreedyMinTaxi,764.3,22.48,0.9887,0.0
+GreedyLeastLoaded,893.0,22.48,0.6424,23.46
+GreedyBalanced (a=0.5),764.5,22.48,0.9876,0.05

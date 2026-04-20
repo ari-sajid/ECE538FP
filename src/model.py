@@ -108,8 +108,13 @@ class SpatioTemporalGNN(nn.Module):
                         heads=num_heads, concat=True,
                         dropout=dropout, add_self_loops=False,
                     ),
+                    ("flight", "same_terminal", "flight"): GATConv(
+                        hidden_channels, head_dim,
+                        heads=num_heads, concat=True,
+                        dropout=dropout, add_self_loops=False,
+                    ),
                 },
-                aggr="sum",  # sum turnaround and congestion attention outputs
+                aggr="sum",
             )
             self.convs.append(conv)
             self.norms.append(nn.LayerNorm(hidden_channels))
