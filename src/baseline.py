@@ -154,13 +154,18 @@ def simulate_queuing_f3(
         g_times   = dep_arr[g_indices]                  # [Ng]
         total_slots = float(GATE_SLOTS[GATE_CLASSES[g_idx]])
 
-        # Pairwise time differences: dt[i, j] = |t_i - t_j|
-        dt = np.abs(g_times[:, None] - g_times[None, :])  # [Ng, Ng]
-        concurrent = (dt < DENSITY_WINDOW_MIN).sum(axis=1).astype(np.float64)  # [Ng]
+        # Sorted binary-search sliding window — O(N log N), O(N) memory.
+        # For each flight, count how many others depart within DENSITY_WINDOW_MIN
+        # without materialising an [Ng, Ng] matrix.
+        sort_ord     = np.argsort(g_times)
+        sorted_t     = g_times[sort_ord]
+        lo = np.searchsorted(sorted_t, sorted_t - DENSITY_WINDOW_MIN, side="left")
+        hi = np.searchsorted(sorted_t, sorted_t + DENSITY_WINDOW_MIN, side="right")
+        concurrent   = (hi - lo).astype(np.float64)      # [Ng]
 
-        fill_ratio = concurrent / total_slots             # [Ng]
+        fill_ratio = concurrent / total_slots
         excess     = np.maximum(0.0, fill_ratio - DENSITY_THRESHOLD)
-        density_delays[g_indices] = DENSITY_FACTOR * excess ** 2
+        density_delays[g_indices[sort_ord]] = DENSITY_FACTOR * excess ** 2
 
     wait_times += density_delays
     return wait_times
