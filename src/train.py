@@ -660,6 +660,35 @@ def main():
     except Exception:
         pass
 
+    # ── Baseline policy pre-evaluation (reference before training starts) ───
+    from src.baselines import GreedyCapacityAware as _GCA           # noqa: E402
+    print("=" * 64)
+    print("  Baseline policy (GreedyCapacityAware) — simulator results")
+    print("=" * 64)
+    try:
+        _raw_df = pd.read_csv(RAW_CSV, low_memory=False)
+        _raw_df["FL_DATE"] = pd.to_datetime(_raw_df["FL_DATE"])
+        _gca = _GCA(str(GATE_MAP))
+
+        for _split_name, _month_filter in [
+            ("Train  (months 1-8) ", lambda m: m <= 8),
+            ("Val    (months 9-10)", lambda m: (m >= 9) & (m <= 10)),
+            ("Test   (months 11-12)", lambda m: m > 10),
+        ]:
+            _split_df  = _raw_df[_month_filter(_raw_df["FL_DATE"].dt.month)].reset_index(drop=True)
+            _split_asgn = _gca.assign(_split_df)
+            _split_met  = _gca.score(_split_asgn, _split_df)
+            print(f"  {_split_name} :  "
+                  f"taxi={_split_met['f3_taxi_min']:.3f} min  "
+                  f"queue={_split_met['f3_queue_min']:.3f} min  "
+                  f"total={_split_met['f3_total_min']:.3f} min  "
+                  f"[{_split_met['n_assigned']:,} assigned]")
+        del _raw_df, _gca, _split_df, _split_asgn, _split_met
+    except Exception as _e:
+        print(f"  (baseline pre-eval skipped: {_e})")
+    print("=" * 64)
+    print()
+
     # ── Training loop with early stopping on val loss ─────────────────────
     print("=" * 106)
     print("Constrained GNN Scheduler  |  gate masking enforced structurally (not as loss)")
