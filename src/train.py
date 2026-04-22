@@ -87,12 +87,13 @@ DEFAULTS = dict(
     num_neighbors_l2 = 5,
     num_neighbors_l3 = 5,   # must match num_layers=3
     window_hours     = 4,
-    # Loss weights
+    # Loss weights — all components now in MINUTES; weights are unitless
+    # L_taxi + L_cong + L_fill ≈ hard-sim total (min) at convergence
     alpha            = 0.0,  # legacy (not used; kept for CLI compat)
-    beta             = 1.0,  # L_taxi weight
-    eta              = 0.2,  # L_fill (gate-zone density penalty) weight
-    gamma            = 0.05, # L_turn (turnaround smoothness) weight
-    lam              = 0.5,  # L_cong (soft congestion proxy) weight
+    beta             = 1.0,  # L_taxi  weight (taxi minutes)
+    lam              = 1.0,  # L_cong  weight (queue minutes, M/D/K proxy)
+    eta              = 1.0,  # L_fill  weight (density-delay minutes)
+    gamma            = 0.05, # L_turn  weight (smoothness regulariser)
     delay_scale      = 30.0, # legacy (not used; kept for CLI compat)
     entropy_weight   = 0.0,  # legacy (not used; kept for CLI compat)
     delta            = 0.0,  # legacy (not used; kept for CLI compat)

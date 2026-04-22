@@ -174,74 +174,44 @@ class TaxiingDistanceLoss(nn.Module):
 
 class SoftCongestionLoss(nn.Module):
     """
-    Differentiable proxy for queueing delay, weighted by aircraft slot consumption:
+    Differentiable M/D/K-style queueing proxy, in MINUTES.
 
-        E[T_queue_soft] = (1/M) Σ_i Σ_j exp(-|t_i - t_j| / τ) × (p_i · p_j) × units_i × units_j
+    Mirrors the hard simulator's slot-based overload behaviour:
 
-    where p_i · p_j = dot(gate_probs_i, gate_probs_j) = P(same gate class).
-    Widebody flights (units=2) contribute 4× more congestion than narrowbodies (units=1).
+        ρ(w, g) = E[slot-units demanded in window w for gate g] × service_time
+                  / (GATE_SLOTS[g] × window_min)
+
+        wait(ρ) = service_time × FACTOR × max(0, ρ − rho_threshold)²        [minutes]
+
+        E[wait_i] = Σ_g p_i[g] × wait(ρ(w(i), g))
+
+    Calibration: threshold 0.85 + factor 10 matches M/D/K behaviour where
+    queues only explode near ρ=1 (wait ≈ 13.5 min at ρ=1.0 matches observed
+    hard-sim GNN-overload queue ≈ 12.8 min; wait ≈ 0 at ρ ≤ 0.85 matches the
+    negligible M/D/K wait for capacity-balanced assignments).
 
     Parameters
     ----------
-    tau : float
-        Temporal kernel bandwidth in minutes (default 30).
+    window_min       : float   Bucket width in minutes (default 30).
+    gate_occupy_min  : float   Slot hold time = service_time (default 60).
+    rho_threshold    : float   Utilisation below which no wait (default 0.85).
+    factor           : float   Scale factor on the quadratic (default 10.0).
     """
 
-    def __init__(self, tau: float = 30.0):
-        super().__init__()
-        self.tau = tau
-
-    def forward(
+    def __init__(
         self,
-        gate_probs: torch.Tensor,      # [N, G]
-        dep_time_min: torch.Tensor,    # [N]
-        is_at_ewr: torch.Tensor,       # [N]  float: 1 = EWR flight
-        aircraft_slots: torch.Tensor,  # [N]  float: 2.0 = widebody, 1.0 = narrowbody
-    ) -> torch.Tensor:
-        ewr = is_at_ewr.bool()
-        if ewr.sum() < 2:
-            return gate_probs.new_tensor(0.0)
-        p     = gate_probs[ewr]                                  # [M, G]
-        t     = dep_time_min[ewr].float()                        # [M]
-        units = aircraft_slots[ewr].float()                      # [M]
-        dt    = (t.unsqueeze(0) - t.unsqueeze(1)).abs()          # [M, M]
-        w     = torch.exp(-dt / self.tau)                        # [M, M]
-        st    = p @ p.T                                          # [M, M] same-class prob
-        # Weight by product of slot sizes: heavier aircraft create more congestion
-        u_sq  = units.unsqueeze(0) * units.unsqueeze(1)          # [M, M]
-        return (w * u_sq * st).mean()
-
-
-# ---------------------------------------------------------------------------
-# L_fill — Differentiable gate-zone density / proximity penalty
-# ---------------------------------------------------------------------------
-
-class GateFillPenaltyLoss(nn.Module):
-    """
-    Penalises dense packing of flights in a gate zone.
-
-    Physical motivation: when many planes share a zone simultaneously their
-    proximity slows ground-crew manoeuvring, raising effective taxi-out time.
-    This mirrors the DENSITY_FACTOR term in the hard simulator.
-
-    For each 30-min departure window w and gate class g:
-        E[slots_used_{g,w}] = Σ_{i∈w} p_i[g] × units_i
-        fill_ratio_{g,w}    = E[slots_used_{g,w}] / GATE_SLOTS[g]
-        penalty_{g,w}       = max(0, fill_ratio - threshold)^2
-
-    The result is the mean over all (window, gate-class) pairs — fully
-    vectorised via scatter_add so no Python loop over windows.
-
-    Parameters
-    ----------
-    window_min : float   Departure-time bucket width in minutes (default 30).
-    threshold  : float   Fill fraction below which no penalty applies (0.3).
-    """
-
-    def __init__(self, window_min: float = 30.0, threshold: float = 0.30):
+        window_min: float = 30.0,
+        gate_occupy_min: float = 60.0,
+        rho_threshold: float = 0.85,
+        factor: float = 10.0,
+        # Accepted for backward compat; ignored (old kernel-based proxy)
+        tau: float = 30.0,
+    ):
         super().__init__()
-        self.window_min = window_min
-        self.threshold  = threshold
+        self.window_min      = window_min
+        self.gate_occupy_min = gate_occupy_min
+        self.rho_threshold   = rho_threshold
+        self.factor          = factor
         gate_caps = torch.tensor(
             [GATE_SLOTS[g] for g in GATE_CLASSES], dtype=torch.float32
         )
@@ -262,28 +232,106 @@ class GateFillPenaltyLoss(nn.Module):
         t     = dep_time_min[ewr].float()    # [M]
         units = aircraft_slots[ewr].float()  # [M]
 
-        # Map each flight to a departure-window bucket (0-indexed within batch)
-        raw_bucket  = (t / self.window_min).long()
-        min_bucket  = raw_bucket.min()
-        bucket_idx  = raw_bucket - min_bucket         # [M], starts at 0
-        W           = int(bucket_idx.max().item()) + 1
+        raw_bucket = (t / self.window_min).long()
+        min_bucket = raw_bucket.min()
+        bucket_idx = raw_bucket - min_bucket                      # [M]
+        W          = int(bucket_idx.max().item()) + 1
 
-        # Expected slot-units per (window, gate): scatter_add over flights
-        # weighted[i, g] = p[i, g] * units[i]
-        weighted = p * units.unsqueeze(1)             # [M, G]
-        # expected_slots[w, g] = Σ_{i: bucket=w} weighted[i, g]
+        # Expected slot-units per (window, gate) via scatter_add
+        weighted       = p * units.unsqueeze(1)                   # [M, G]
+        expected_units = torch.zeros(
+            W, NUM_GATES, dtype=p.dtype, device=p.device
+        )
+        expected_units.scatter_add_(
+            0, bucket_idx.unsqueeze(1).expand_as(weighted), weighted
+        )                                                          # [W, G]
+
+        # ρ = slot-minutes demanded / slot-minutes available
+        rho = (expected_units * self.gate_occupy_min) / (
+            self.gate_caps.unsqueeze(0) * self.window_min
+        )                                                          # [W, G]
+
+        excess  = torch.clamp(rho - self.rho_threshold, min=0.0)
+        wait_wg = self.gate_occupy_min * self.factor * excess ** 2  # [W, G] (minutes)
+
+        # Per-flight expected wait: look up the flight's own bucket/gate distribution
+        flight_wait = (p * wait_wg[bucket_idx]).sum(dim=-1)         # [M]
+        return flight_wait.mean()
+
+
+# ---------------------------------------------------------------------------
+# L_fill — Differentiable gate-zone density / proximity penalty
+# ---------------------------------------------------------------------------
+
+class GateFillPenaltyLoss(nn.Module):
+    """
+    Differentiable density-proximity delay, in MINUTES — exact soft analog of
+    the hard simulator's density term:
+
+        fill_ratio(w, g) = E[slot-units in window w for gate g] / GATE_SLOTS[g]
+        delay(w, g)      = FACTOR × max(0, fill_ratio − threshold)²   [minutes]
+        E[delay_i]       = Σ_g p_i[g] × delay(w(i), g)
+
+    Default FACTOR=8.0, threshold=0.30, window_min=60.0 match DENSITY_FACTOR /
+    DENSITY_THRESHOLD / DENSITY_WINDOW_MIN in baseline.py — keep them in sync.
+
+    Parameters
+    ----------
+    window_min : float   Density look-around window in minutes (default 60).
+    threshold  : float   Fill fraction below which no penalty (default 0.3).
+    factor     : float   Max extra minutes at ρ=1 above threshold (default 8).
+    """
+
+    def __init__(
+        self,
+        window_min: float = 60.0,
+        threshold: float = 0.30,
+        factor: float = 8.0,
+    ):
+        super().__init__()
+        self.window_min = window_min
+        self.threshold  = threshold
+        self.factor     = factor
+        gate_caps = torch.tensor(
+            [GATE_SLOTS[g] for g in GATE_CLASSES], dtype=torch.float32
+        )
+        self.register_buffer("gate_caps", gate_caps)   # [G]
+
+    def forward(
+        self,
+        gate_probs: torch.Tensor,      # [N, G]
+        dep_time_min: torch.Tensor,    # [N]
+        is_at_ewr: torch.Tensor,       # [N]  float: 1 = EWR flight
+        aircraft_slots: torch.Tensor,  # [N]  float: 2.0 = widebody, 1.0 = NB
+    ) -> torch.Tensor:
+        ewr = is_at_ewr.bool()
+        if ewr.sum() < 2:
+            return gate_probs.new_tensor(0.0)
+
+        p     = gate_probs[ewr]              # [M, G]
+        t     = dep_time_min[ewr].float()    # [M]
+        units = aircraft_slots[ewr].float()  # [M]
+
+        raw_bucket = (t / self.window_min).long()
+        min_bucket = raw_bucket.min()
+        bucket_idx = raw_bucket - min_bucket                       # [M]
+        W          = int(bucket_idx.max().item()) + 1
+
+        weighted       = p * units.unsqueeze(1)                    # [M, G]
         expected_slots = torch.zeros(
             W, NUM_GATES, dtype=p.dtype, device=p.device
         )
         expected_slots.scatter_add_(
-            0,
-            bucket_idx.unsqueeze(1).expand_as(weighted),
-            weighted,
-        )                                             # [W, G]
+            0, bucket_idx.unsqueeze(1).expand_as(weighted), weighted
+        )                                                           # [W, G]
 
-        fill_ratio = expected_slots / self.gate_caps.unsqueeze(0)  # [W, G]
+        fill_ratio = expected_slots / self.gate_caps.unsqueeze(0)   # [W, G]
         excess     = torch.clamp(fill_ratio - self.threshold, min=0.0)
-        return (excess ** 2).mean()
+        delay_wg   = self.factor * excess ** 2                      # [W, G] (minutes)
+
+        # Per-flight expected density delay
+        flight_delay = (p * delay_wg[bucket_idx]).sum(dim=-1)       # [M]
+        return flight_delay.mean()
 
 
 # ---------------------------------------------------------------------------
