@@ -93,10 +93,10 @@ DENSITY_WINDOW_MIN = 60.0  # look-around window for concurrent occupancy count
 
 
 def _wb_int(series: pd.Series) -> np.ndarray:
-    """Convert WIDEBODY column (Yes/No strings or 0/1 numeric) → int8 array."""
+    """Convert WIDEBODY column (Yes/No strings or 0/1 numeric) → int8 numpy array."""
     if series.dtype == object:
-        return (series == "Yes").astype(np.int8)
-    return series.fillna(0).astype(np.int8)
+        return (series == "Yes").to_numpy(dtype=np.int8)
+    return series.fillna(0).to_numpy(dtype=np.int8)
 
 
 def simulate_queuing_f3(
@@ -247,7 +247,8 @@ class GreedyFirstFit:
         assignments : ndarray[int], shape (N,)
             Gate class index 0-4 per flight, or UNASSIGNED (-1).
         """
-        sort_idx  = np.lexsort((df["CRS_DEP_TIME"].values, df["FL_DATE"].values))
+        crs_dep   = pd.to_numeric(df["CRS_DEP_TIME"], errors="coerce").fillna(0).astype(int)
+        sort_idx  = np.lexsort((crs_dep.values, df["FL_DATE"].values))
         sorted_df = df.iloc[sort_idx].reset_index(drop=True)
 
         assignments = np.full(len(sorted_df), UNASSIGNED, dtype=np.int8)

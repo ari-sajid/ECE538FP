@@ -688,7 +688,9 @@ def main():
                   f"[{_split_met['n_assigned']:,} assigned]")
         del _raw_df, _gca, _split_df, _split_asgn, _split_met
     except Exception as _e:
-        print(f"  (baseline pre-eval skipped: {_e})")
+        import traceback as _tb
+        print(f"  (baseline pre-eval error: {_e})")
+        _tb.print_exc()
     print("=" * 64)
     print()
 
