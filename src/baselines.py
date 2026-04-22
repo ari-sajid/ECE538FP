@@ -27,7 +27,7 @@ from src.baseline import (                          # noqa: E402
     GATE_CLASSES, GATE_TO_IDX,
     APPROX_DIST_M, FALLBACK_GATE, AIRPORT_GATE_ORDER,
     GATE_SLOTS, IS_NARROW_GATE,
-    UNASSIGNED,
+    UNASSIGNED, _wb_int,
 )
 
 RAW_CSV  = ROOT / "data" / "raw"  / "nyc_master_2025.csv"
@@ -68,7 +68,7 @@ class GreedyCapacityAware(GreedyFirstFit):
         # load_units[(gate_idx, bucket)] = slot-units assigned so far
         load_units: dict = defaultdict(int)
 
-        widebody_col = sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index))
+        widebody_arr = _wb_int(sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index)))
 
         for i, row in sorted_df.iterrows():
             airport = self._resolve_airport(row)
@@ -76,7 +76,7 @@ class GreedyCapacityAware(GreedyFirstFit):
                 continue
 
             carrier   = row["OP_UNIQUE_CARRIER"]
-            is_wide   = bool(widebody_col.iloc[i])
+            is_wide   = bool(widebody_arr[i])
             key       = (carrier, airport)
             bucket    = int(row["CRS_DEP_TIME"]) // 30
             candidates = list(self.valid_gates.get(key, []))

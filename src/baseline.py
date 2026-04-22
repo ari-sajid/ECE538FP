@@ -92,6 +92,13 @@ DENSITY_THRESHOLD = 0.30   # fill fraction below which no penalty applies
 DENSITY_WINDOW_MIN = 60.0  # look-around window for concurrent occupancy count
 
 
+def _wb_int(series: pd.Series) -> np.ndarray:
+    """Convert WIDEBODY column (Yes/No strings or 0/1 numeric) → int8 array."""
+    if series.dtype == object:
+        return (series == "Yes").astype(np.int8)
+    return series.fillna(0).astype(np.int8)
+
+
 def simulate_queuing_f3(
     assignments: np.ndarray,      # [N] gate class index (-1 = unassigned)
     dep_times_min: np.ndarray,    # [N] departure time in minutes since epoch
@@ -245,7 +252,7 @@ class GreedyFirstFit:
 
         assignments = np.full(len(sorted_df), UNASSIGNED, dtype=np.int8)
 
-        widebody_col = sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index))
+        widebody_arr = _wb_int(sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index)))
 
         for i, row in sorted_df.iterrows():
             airport = self._resolve_airport(row)
@@ -253,7 +260,7 @@ class GreedyFirstFit:
                 continue
 
             carrier   = row["OP_UNIQUE_CARRIER"]
-            is_wide   = bool(widebody_col.iloc[i])
+            is_wide   = bool(widebody_arr[i])
             key       = (carrier, airport)
             candidates = self.valid_gates.get(key, [])
 
@@ -293,7 +300,7 @@ class GreedyFirstFit:
         N = len(df)
         assigned_mask = assignments != UNASSIGNED
 
-        widebody_arr = df.get("WIDEBODY", pd.Series(0, index=df.index)).fillna(0).values
+        widebody_arr = _wb_int(df.get("WIDEBODY", pd.Series(0, index=df.index)))
 
         # ── F1: gate-constraint violations ──────────────────────────────────────
         violations = 0

@@ -226,7 +226,10 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     is_at_ewr = is_at_ewr.astype(np.float32)
 
     # ── Widebody aircraft flag ────────────────────────────────────────────────
-    is_widebody = df.get("WIDEBODY", pd.Series(0, index=df.index)).fillna(0).astype(np.float32).values
+    _wb_raw = df.get("WIDEBODY", pd.Series(0, index=df.index))
+    if _wb_raw.dtype == object:
+        _wb_raw = (_wb_raw == "Yes").astype(np.int8)
+    is_widebody = _wb_raw.fillna(0).astype(np.float32).values
 
     # ── Feature matrix ──────────────────────────────────────────────────────
     skip = {"FL_DATE", "DEP_TIME", "DEP_DELAY"}
@@ -829,7 +832,10 @@ def main():
 
     carriers       = test_df["OP_UNIQUE_CARRIER"].values
     airports       = np.where(test_df["ORIGIN"] == "EWR", "EWR", None)
-    widebody_test  = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index)).fillna(0).values
+    _wb_test = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index))
+    if _wb_test.dtype == object:
+        _wb_test = (_wb_test == "Yes").astype(np.int8)
+    widebody_test = _wb_test.fillna(0).values
     fl_dates_min   = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
     dep_min_of_day = ((test_df["CRS_DEP_TIME"].values // 100) * 60
                       + (test_df["CRS_DEP_TIME"].values % 100))
