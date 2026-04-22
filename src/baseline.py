@@ -93,10 +93,11 @@ DENSITY_WINDOW_MIN = 60.0  # look-around window for concurrent occupancy count
 
 
 def _wb_int(series: pd.Series) -> np.ndarray:
-    """Convert WIDEBODY column (Yes/No strings or 0/1 numeric) → int8 numpy array."""
-    if series.dtype == object:
-        return (series == "Yes").to_numpy(dtype=np.int8)
-    return series.fillna(0).to_numpy(dtype=np.int8)
+    """Convert WIDEBODY column (Yes/No strings, Categorical, or 0/1 numeric) → int8."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).to_numpy(dtype=np.int8)
+    # object or Categorical with 'Yes'/'No' values
+    return (series == "Yes").to_numpy(dtype=np.int8)
 
 
 def simulate_queuing_f3(
