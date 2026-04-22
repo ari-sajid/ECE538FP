@@ -84,6 +84,12 @@ TAXI_SPEED_M_PER_MIN   = 200.0   # ~12 km/h conservative ground speed
 MIN_TURNAROUND_MIN     = 45.0    # gate occupied this long before next departure
 GATE_OCCUPY_WINDOW_MIN = 120.0   # total gate occupancy window per flight
 
+# Density-delay constants: planes parked near each other reduce maneuvering speed.
+# Extra delay = DENSITY_FACTOR * max(0, fill_ratio - DENSITY_THRESHOLD)^2
+DENSITY_FACTOR    = 8.0    # max extra minutes at full (100%) zone occupancy
+DENSITY_THRESHOLD = 0.30   # fill fraction below which no penalty applies
+DENSITY_WINDOW_MIN = 60.0  # look-around window for concurrent occupancy count
+
 
 def simulate_queuing_f3(
     assignments: np.ndarray,      # [N] gate class index (-1 = unassigned)
@@ -91,12 +97,17 @@ def simulate_queuing_f3(
     is_widebody_arr: np.ndarray,  # [N] 1 = widebody, 0 = narrowbody
 ) -> np.ndarray:
     """
-    Slot-based M/D/K queueing simulation.
+    Slot-based M/D/K queueing simulation with density-proximity penalty.
 
     Each gate class has GATE_SLOTS[class] independent NB-equivalent slots.
     Widebody aircraft consume 2 consecutive slots; narrowbody consumes 1.
     Flights sorted by dep_time; each requests slots MIN_TURNAROUND_MIN before
     scheduled departure.  If insufficient slots are free: wait.
+
+    Additionally, a density delay is added: when many planes occupy the same
+    gate zone concurrently (within DENSITY_WINDOW_MIN), reduced maneuvering
+    room slows ground operations.  Penalty is quadratic in fill ratio above
+    DENSITY_THRESHOLD.
 
     Returns
     -------
@@ -129,6 +140,29 @@ def simulate_queuing_f3(
             free_list[s] = t_start + GATE_OCCUPY_WINDOW_MIN
         free_list.sort()
 
+    # ── Density-proximity delay post-pass ────────────────────────────────────
+    # For each gate class, count how many flights depart within DENSITY_WINDOW_MIN
+    # of each other (concurrent ground presence) and penalise high fill ratios.
+    dep_arr = dep_times_min.astype(np.float64)
+    density_delays = np.zeros(len(assignments), dtype=np.float64)
+
+    for g_idx in range(NUM_GATES):
+        g_mask    = (assignments == g_idx)
+        if not g_mask.any():
+            continue
+        g_indices = np.where(g_mask)[0]
+        g_times   = dep_arr[g_indices]                  # [Ng]
+        total_slots = float(GATE_SLOTS[GATE_CLASSES[g_idx]])
+
+        # Pairwise time differences: dt[i, j] = |t_i - t_j|
+        dt = np.abs(g_times[:, None] - g_times[None, :])  # [Ng, Ng]
+        concurrent = (dt < DENSITY_WINDOW_MIN).sum(axis=1).astype(np.float64)  # [Ng]
+
+        fill_ratio = concurrent / total_slots             # [Ng]
+        excess     = np.maximum(0.0, fill_ratio - DENSITY_THRESHOLD)
+        density_delays[g_indices] = DENSITY_FACTOR * excess ** 2
+
+    wait_times += density_delays
     return wait_times
 
 

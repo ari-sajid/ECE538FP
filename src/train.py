@@ -90,6 +90,7 @@ DEFAULTS = dict(
     # Loss weights
     alpha            = 0.0,  # legacy (not used; kept for CLI compat)
     beta             = 1.0,  # L_taxi weight
+    eta              = 0.2,  # L_fill (gate-zone density penalty) weight
     gamma            = 0.05, # L_turn (turnaround smoothness) weight
     lam              = 0.5,  # L_cong (soft congestion proxy) weight
     delay_scale      = 30.0, # legacy (not used; kept for CLI compat)
@@ -341,7 +342,7 @@ def build_hetero_data(
 def train_epoch(model, loader, optimizer, criterion, device,
                 carrier_ohe_all, is_at_ewr_all):
     model.train()
-    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0}
+    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0, "fill": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -370,7 +371,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
         c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
         ewr   = is_at_ewr_all[global_ids.cpu()].to(device)
 
-        loss, l_taxi, l_cong, l_turn = criterion(
+        loss, l_taxi, l_cong, l_fill, l_turn = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
             c_ohe, ewr, is_wide, dep_time_min, turn_src, turn_dst,
         )
@@ -386,6 +387,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
         totals["loss"] += loss.item()
         totals["taxi"] += l_taxi.item()
         totals["cong"] += l_cong.item()
+        totals["fill"] += l_fill.item()
         n_batches      += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -399,7 +401,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
 def eval_epoch(model, loader, criterion, device,
                carrier_ohe_all, is_at_ewr_all):
     model.eval()
-    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0}
+    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0, "fill": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -427,7 +429,7 @@ def eval_epoch(model, loader, criterion, device,
         c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
         ewr   = is_at_ewr_all[global_ids.cpu()].to(device)
 
-        loss, l_taxi, l_cong, l_turn = criterion(
+        loss, l_taxi, l_cong, l_fill, l_turn = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
             c_ohe, ewr, is_wide, dep_time_min, turn_src, turn_dst,
         )
@@ -438,6 +440,7 @@ def eval_epoch(model, loader, criterion, device,
         totals["loss"] += loss.item()
         totals["taxi"] += l_taxi.item()
         totals["cong"] += l_cong.item()
+        totals["fill"] += l_fill.item()
         n_batches      += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -604,6 +607,7 @@ def main():
         carrier_list      = carrier_list,
         alpha             = args.alpha,
         beta              = args.beta,
+        eta               = args.eta,
         gamma             = args.gamma,
         lam               = args.lam,
         delay_scale       = args.delay_scale,
@@ -657,11 +661,11 @@ def main():
         pass
 
     # ── Training loop with early stopping on val loss ─────────────────────
-    print("=" * 88)
+    print("=" * 106)
     print("Constrained GNN Scheduler  |  gate masking enforced structurally (not as loss)")
-    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-Taxi':>8}  {'Tr-Cong':>8}"
-          f"  {'VaLoss':>8}  {'Va-Taxi':>8}  {'Va-Cong':>8}  {'*':>2}")
-    print("=" * 88)
+    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-Taxi':>8}  {'Tr-Cong':>8}  {'Tr-Fill':>8}"
+          f"  {'VaLoss':>8}  {'Va-Taxi':>8}  {'Va-Cong':>8}  {'Va-Fill':>8}  {'*':>2}")
+    print("=" * 106)
 
     history         = []
     best_val_loss   = float("inf")
@@ -706,12 +710,12 @@ def main():
             no_improve += 1
 
         row = (epoch,
-               tr["loss"], tr["taxi"], tr["cong"],
-               va["loss"], va["taxi"], va["cong"])
+               tr["loss"], tr["taxi"], tr["cong"], tr["fill"],
+               va["loss"], va["taxi"], va["cong"], va["fill"])
         history.append(row)
 
-        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['taxi']:8.4f}  {tr['cong']:8.4f}"
-              f"  {va['loss']:8.4f}  {va['taxi']:8.4f}  {va['cong']:8.4f}  {marker}")
+        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['taxi']:8.4f}  {tr['cong']:8.4f}  {tr['fill']:8.4f}"
+              f"  {va['loss']:8.4f}  {va['taxi']:8.4f}  {va['cong']:8.4f}  {va['fill']:8.4f}  {marker}")
 
         if no_improve >= args.patience:
             print(f"\nEarly stopping at epoch {epoch} "
@@ -725,28 +729,29 @@ def main():
                     carrier_ohe, is_at_ewr)
     print(f"\nTest  (best ckpt epoch {best_ckpt['epoch']}):"
           f"  L_taxi={te['taxi']:.4f}  L_cong={te['cong']:.4f}"
-          f"  Total={te['loss']:.4f}")
+          f"  L_fill={te['fill']:.4f}  Total={te['loss']:.4f}")
 
-    # ── Pareto front — 2 objectives: taxi loss and congestion proxy ────────
-    val_pts   = [(r[5], r[6]) for r in history]   # (va_taxi, va_cong)
+    # ── Pareto front — 3 objectives: taxi, congestion, fill proxy ─────────
+    val_pts   = [(r[6], r[7], r[8]) for r in history]   # (va_taxi, va_cong, va_fill)
     front_idx = pareto_front_indices(val_pts)
 
     pareto_rows = [
         {"epoch": history[i][0],
-         "val_taxi": history[i][5], "val_cong": history[i][6]}
+         "val_taxi": history[i][6], "val_cong": history[i][7],
+         "val_fill": history[i][8]}
         for i in front_idx
     ]
     pareto_df = pd.DataFrame(pareto_rows).sort_values("val_taxi")
     pareto_df.to_csv(OUT_DIR / "pareto_front.csv", index=False)
-    print("\nPareto-optimal epochs (val set, lower taxi and cong is better):")
+    print("\nPareto-optimal epochs (val set, lower taxi/cong/fill is better):")
     print(pareto_df.to_string(index=False))
 
     # Save full epoch history
     hist_df = pd.DataFrame(
         history,
         columns=["epoch",
-                 "train_loss", "train_taxi", "train_cong",
-                 "val_loss",   "val_taxi",   "val_cong"],
+                 "train_loss", "train_taxi", "train_cong", "train_fill",
+                 "val_loss",   "val_taxi",   "val_cong",   "val_fill"],
     )
     hist_df.to_csv(OUT_DIR / "training_history.csv", index=False)
 
@@ -756,6 +761,7 @@ def main():
         "test_loss"  : te["loss"],
         "test_taxi"  : te["taxi"],
         "test_cong"  : te["cong"],
+        "test_fill"  : te["fill"],
     }])
     test_row.to_csv(OUT_DIR / "test_metrics.csv", index=False)
 

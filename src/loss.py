@@ -10,10 +10,11 @@ Signal decomposition
 
 Training loss (lower is better for all)
 ----------------------------------------
-    L = β·L_taxi  +  λ·L_cong  +  γ·L_turn
+    L = β·L_taxi  +  λ·L_cong  +  η·L_fill  +  γ·L_turn
 
     L_taxi   — differentiable expected taxi time  E[T_taxi]  (TaxiingDistanceLoss)
     L_cong   — differentiable congestion proxy    E[T_queue_soft]  (SoftCongestionLoss)
+    L_fill   — gate-zone density penalty: dense packing slows ground ops  (GateFillPenaltyLoss)
     L_turn   — turnaround smoothness regulariser  (TurnaroundSmoothnessLoss)
 
 Gate feasibility is enforced *structurally* via GateMasker.mask_logits()
@@ -212,6 +213,80 @@ class SoftCongestionLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# L_fill — Differentiable gate-zone density / proximity penalty
+# ---------------------------------------------------------------------------
+
+class GateFillPenaltyLoss(nn.Module):
+    """
+    Penalises dense packing of flights in a gate zone.
+
+    Physical motivation: when many planes share a zone simultaneously their
+    proximity slows ground-crew manoeuvring, raising effective taxi-out time.
+    This mirrors the DENSITY_FACTOR term in the hard simulator.
+
+    For each 30-min departure window w and gate class g:
+        E[slots_used_{g,w}] = Σ_{i∈w} p_i[g] × units_i
+        fill_ratio_{g,w}    = E[slots_used_{g,w}] / GATE_SLOTS[g]
+        penalty_{g,w}       = max(0, fill_ratio - threshold)^2
+
+    The result is the mean over all (window, gate-class) pairs — fully
+    vectorised via scatter_add so no Python loop over windows.
+
+    Parameters
+    ----------
+    window_min : float   Departure-time bucket width in minutes (default 30).
+    threshold  : float   Fill fraction below which no penalty applies (0.3).
+    """
+
+    def __init__(self, window_min: float = 30.0, threshold: float = 0.30):
+        super().__init__()
+        self.window_min = window_min
+        self.threshold  = threshold
+        gate_caps = torch.tensor(
+            [GATE_SLOTS[g] for g in GATE_CLASSES], dtype=torch.float32
+        )
+        self.register_buffer("gate_caps", gate_caps)   # [G]
+
+    def forward(
+        self,
+        gate_probs: torch.Tensor,      # [N, G]
+        dep_time_min: torch.Tensor,    # [N]
+        is_at_ewr: torch.Tensor,       # [N]  float: 1 = EWR flight
+        aircraft_slots: torch.Tensor,  # [N]  float: 2.0 = widebody, 1.0 = NB
+    ) -> torch.Tensor:
+        ewr = is_at_ewr.bool()
+        if ewr.sum() < 2:
+            return gate_probs.new_tensor(0.0)
+
+        p     = gate_probs[ewr]              # [M, G]
+        t     = dep_time_min[ewr].float()    # [M]
+        units = aircraft_slots[ewr].float()  # [M]
+
+        # Map each flight to a departure-window bucket (0-indexed within batch)
+        raw_bucket  = (t / self.window_min).long()
+        min_bucket  = raw_bucket.min()
+        bucket_idx  = raw_bucket - min_bucket         # [M], starts at 0
+        W           = int(bucket_idx.max().item()) + 1
+
+        # Expected slot-units per (window, gate): scatter_add over flights
+        # weighted[i, g] = p[i, g] * units[i]
+        weighted = p * units.unsqueeze(1)             # [M, G]
+        # expected_slots[w, g] = Σ_{i: bucket=w} weighted[i, g]
+        expected_slots = torch.zeros(
+            W, NUM_GATES, dtype=p.dtype, device=p.device
+        )
+        expected_slots.scatter_add_(
+            0,
+            bucket_idx.unsqueeze(1).expand_as(weighted),
+            weighted,
+        )                                             # [W, G]
+
+        fill_ratio = expected_slots / self.gate_caps.unsqueeze(0)  # [W, G]
+        excess     = torch.clamp(fill_ratio - self.threshold, min=0.0)
+        return (excess ** 2).mean()
+
+
+# ---------------------------------------------------------------------------
 # L_turn — Turnaround smoothness regulariser
 # ---------------------------------------------------------------------------
 
@@ -238,7 +313,7 @@ class TurnaroundSmoothnessLoss(nn.Module):
 
 class MultiObjectiveLoss(nn.Module):
     """
-    L = β·L_taxi  +  λ·L_cong  +  γ·L_turn
+    L = β·L_taxi  +  λ·L_cong  +  η·L_fill  +  γ·L_turn
 
     Gate feasibility enforced structurally via GateMasker (carrier auth + aircraft type).
 
@@ -246,10 +321,11 @@ class MultiObjectiveLoss(nn.Module):
     ----------
     gate_mapping_path : str
     carrier_list : list[str]
-    beta : float   — L_taxi weight
-    lam  : float   — L_cong weight
-    gamma: float   — L_turn weight
-    tau  : float   — SoftCongestionLoss bandwidth (minutes)
+    beta  : float  — L_taxi weight
+    lam   : float  — L_cong weight
+    eta   : float  — L_fill weight (zone density penalty)
+    gamma : float  — L_turn weight
+    tau   : float  — SoftCongestionLoss bandwidth (minutes)
     """
 
     def __init__(
@@ -258,6 +334,7 @@ class MultiObjectiveLoss(nn.Module):
         carrier_list: List[str],
         beta: float = 1.0,
         lam: float = 0.5,
+        eta: float = 0.2,
         gamma: float = 0.05,
         tau: float = 30.0,
         # Legacy params accepted but ignored
@@ -271,11 +348,13 @@ class MultiObjectiveLoss(nn.Module):
         super().__init__()
         self.beta  = beta
         self.lam   = lam
+        self.eta   = eta
         self.gamma = gamma
 
         self.masker = GateMasker(gate_mapping_path, carrier_list)
         self.f2     = TaxiingDistanceLoss()
         self.cong   = SoftCongestionLoss(tau=tau)
+        self.fill   = GateFillPenaltyLoss()
         self.turn   = TurnaroundSmoothnessLoss()
 
     def forward(
@@ -289,13 +368,14 @@ class MultiObjectiveLoss(nn.Module):
         dep_time_min: torch.Tensor,   # [N]  departure time in minutes
         turn_src: torch.Tensor,       # [E]
         turn_dst: torch.Tensor,       # [E]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
         -------
         total     : scalar
         loss_taxi : scalar – expected taxi time (minutes)
         loss_cong : scalar – soft congestion proxy
+        loss_fill : scalar – gate-zone density penalty
         loss_turn : scalar – turnaround smoothness
         """
         masked_logits = self.masker.mask_logits(gate_logits, carrier_ohe, is_widebody)
@@ -309,14 +389,16 @@ class MultiObjectiveLoss(nn.Module):
 
         loss_taxi = self.f2(masked_logits, is_at_ewr)
         loss_cong = self.cong(gate_probs, dep_time_min, is_at_ewr, aircraft_slots)
+        loss_fill = self.fill(gate_probs, dep_time_min, is_at_ewr, aircraft_slots)
         loss_turn = self.turn(delay_pred, turn_src, turn_dst)
 
         total = (
             self.beta  * loss_taxi
             + self.lam   * loss_cong
+            + self.eta   * loss_fill
             + self.gamma * loss_turn
         )
-        return total, loss_taxi, loss_cong, loss_turn
+        return total, loss_taxi, loss_cong, loss_fill, loss_turn
 
 
 # ---------------------------------------------------------------------------
