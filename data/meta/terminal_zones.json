@@ -1,0 +1,7 @@
+{
+  "EWR_A_Wide":   {"dist_m": 810,  "gate_count": 4,  "slots": 8,  "type": "wide"},
+  "EWR_A_Narrow": {"dist_m": 810,  "gate_count": 29, "slots": 29, "type": "narrow"},
+  "EWR_B_Narrow": {"dist_m": 1140, "gate_count": 9,  "slots": 9,  "type": "narrow"},
+  "EWR_C_Wide":   {"dist_m": 1380, "gate_count": 2,  "slots": 4,  "type": "wide"},
+  "EWR_C_Narrow": {"dist_m": 1380, "gate_count": 55, "slots": 55, "type": "narrow"}
+}

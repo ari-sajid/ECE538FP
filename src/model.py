@@ -34,11 +34,11 @@ from torch_geometric.nn import GATConv, HeteroConv
 # Shared gate-class constants (imported by loss.py and train.py as well)
 # ---------------------------------------------------------------------------
 GATE_CLASSES = [
-    "EWR_Terminal_A",  # index 0
-    "EWR_Terminal_B",  # index 1
-    "EWR_Terminal_C",  # index 2
-    "LGA_Terminal_B",  # index 3
-    "LGA_Terminal_C",  # index 4
+    "EWR_A_Wide",    # index 0 — Terminal A widebody gates
+    "EWR_A_Narrow",  # index 1 — Terminal A narrowbody gates
+    "EWR_B_Narrow",  # index 2 — Terminal B narrowbody gates
+    "EWR_C_Wide",    # index 3 — Terminal C widebody gates
+    "EWR_C_Narrow",  # index 4 — Terminal C narrowbody gates
 ]
 NUM_GATES = len(GATE_CLASSES)  # 5
 
@@ -55,7 +55,7 @@ class SpatioTemporalGNN(nn.Module):
         Width of all internal layers (default 128).
         Must be divisible by num_heads.
     num_gates : int
-        Number of terminal/gate classes (default 5 = 3 EWR + 2 LGA).
+        Number of terminal/gate classes (default 3 = EWR only).
     num_layers : int
         Number of heterogeneous message-passing rounds (default 3).
     dropout : float
@@ -108,8 +108,13 @@ class SpatioTemporalGNN(nn.Module):
                         heads=num_heads, concat=True,
                         dropout=dropout, add_self_loops=False,
                     ),
+                    ("flight", "same_terminal", "flight"): GATConv(
+                        hidden_channels, head_dim,
+                        heads=num_heads, concat=True,
+                        dropout=dropout, add_self_loops=False,
+                    ),
                 },
-                aggr="sum",  # sum turnaround and congestion attention outputs
+                aggr="sum",
             )
             self.convs.append(conv)
             self.norms.append(nn.LayerNorm(hidden_channels))
