@@ -9,11 +9,11 @@ output_dir = 'data/processed/'
 os.makedirs(output_dir, exist_ok=True)
 
 GATE_TO_IDX = {
-    "EWR_Terminal_A": 0,
-    "EWR_Terminal_B": 1,
-    "EWR_Terminal_C": 2,
-    "LGA_Terminal_B": 3,
-    "LGA_Terminal_C": 4,
+    "EWR_A_Wide":   0,
+    "EWR_A_Narrow": 1,
+    "EWR_B_Narrow": 2,
+    "EWR_C_Wide":   3,
+    "EWR_C_Narrow": 4,
 }
 NUM_GATES = 5
 
@@ -40,9 +40,9 @@ for tail, group in df.groupby('TAIL_NUM'):
 # ---------------------------------------------------------------------------
 # 2. Congestion Edges — same airport, departure within 15 min
 # ---------------------------------------------------------------------------
-print("Generating Congestion Edges (Shared Window at EWR/LGA)...")
+print("Generating Congestion Edges (Shared Window at EWR)...")
 
-for airport in ['EWR', 'LGA']:
+for airport in ['EWR']:
     airport_df = df[df['ORIGIN'] == airport].sort_values('CRS_DEP_TIME')
     for i in range(len(airport_df) - 1):
         for j in range(1, min(10, len(airport_df) - i)):
@@ -72,19 +72,24 @@ def _hhmm_to_min(t: int) -> int:
     return (t // 100) * 60 + (t % 100)
 
 
+_TERMINAL_TO_GATE_INDICES = {
+    "Terminal_A": {0, 1},  # EWR_A_Wide + EWR_A_Narrow
+    "Terminal_B": {2},     # EWR_B_Narrow
+    "Terminal_C": {3, 4},  # EWR_C_Wide + EWR_C_Narrow
+}
+
+
 def _terminal_group(carrier: str, airport: str) -> set:
     """Set of gate indices the carrier is authorized to use at this airport."""
     gates = set()
     for term_name, carriers in gate_map.get(airport, {}).items():
         if carrier in carriers:
-            key = f"{airport}_{term_name}"
-            if key in GATE_TO_IDX:
-                gates.add(GATE_TO_IDX[key])
+            gates |= _TERMINAL_TO_GATE_INDICES.get(term_name, set())
     # Unmapped carrier → all gates are notionally valid (no restriction)
     return gates if gates else set(range(NUM_GATES))
 
 
-for airport in ['EWR', 'LGA']:
+for airport in ['EWR']:
     # Sort by (date, time) so the break condition is correct within each day
     ap_df = (df[df['ORIGIN'] == airport]
              .sort_values(['FL_DATE', 'CRS_DEP_TIME'])

@@ -1,31 +1,25 @@
 """
-Multi-objective loss for the airport gate-scheduling GNN.
+Multi-objective loss for the EWR gate-scheduling GNN.
 
-Objective definitions (lower is better for all)
-------------------------------------------------
-F2 – Taxiing Distance Loss
-     Minimises the expected taxiing distance from the predicted terminal
-     to the active runway:
-         E[dist] = softmax(gate_logits) · precomputed_distance_vector
+Signal decomposition
+--------------------
+    T_sim = T_taxi + T_queue
 
-F3 – Schedule Stability Loss (delay-risk proxy)
-     Differentiable approximation of P(departure delay > 15 min):
-         F3 = mean(sigmoid((delay_pred − 15) / 5))
-     Gradient is non-zero for any delay_pred near 15 min; fixed scale
-     avoids the need for a normalisation hyperparameter.
+    T_taxi  = d(assigned_gate_class) / v        deterministic physics
+    T_queue = SoftCongestionLoss proxy           differentiable; replaces hard sim during training
 
-Auxiliary supervised loss
---------------------------
-L_reg  – Huber loss between predicted and observed departure delay.
-         Keeps the delay head calibrated so F3 is meaningful.
+Training loss (lower is better for all)
+----------------------------------------
+    L = β·L_taxi  +  λ·L_cong  +  γ·L_turn
 
-Combined loss
--------------
-    L = β·F2 + γ·F3 + λ·L_reg + ε·(–H)
+    L_taxi   — differentiable expected taxi time  E[T_taxi]  (TaxiingDistanceLoss)
+    L_cong   — differentiable congestion proxy    E[T_queue_soft]  (SoftCongestionLoss)
+    L_turn   — turnaround smoothness regulariser  (TurnaroundSmoothnessLoss)
 
 Gate feasibility is enforced *structurally* via GateMasker.mask_logits()
-(infeasible logits → −∞ before every softmax) and is therefore never a
-loss term — it is always zero by construction.
+(infeasible logits → −∞ before every softmax) — never a loss term.
+
+Evaluation uses the hard M/D/K simulation in baseline.py (simulate_queuing_f3).
 """
 
 import json
@@ -37,50 +31,55 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 GATE_CLASSES: List[str] = [
-    "EWR_Terminal_A",  # 0
-    "EWR_Terminal_B",  # 1
-    "EWR_Terminal_C",  # 2
-    "LGA_Terminal_B",  # 3
-    "LGA_Terminal_C",  # 4
+    "EWR_A_Wide",    # 0 — Terminal A widebody gates
+    "EWR_A_Narrow",  # 1 — Terminal A narrowbody gates
+    "EWR_B_Narrow",  # 2 — Terminal B narrowbody gates
+    "EWR_C_Wide",    # 3 — Terminal C widebody gates
+    "EWR_C_Narrow",  # 4 — Terminal C narrowbody gates
 ]
-NUM_GATES: int = len(GATE_CLASSES)
+NUM_GATES: int = len(GATE_CLASSES)  # 5
 
-# Approximate taxi distances (metres) from each terminal to its airport's runway.
-# These match the values used in baseline.py for apples-to-apples comparison.
+# Approximate taxi distances (metres) from each gate class to EWR's active runway.
 APPROX_DIST_M: Dict[str, int] = {
-    "EWR_Terminal_A": 810,
-    "EWR_Terminal_B": 1140,
-    "EWR_Terminal_C": 1380,
-    "LGA_Terminal_B": 660,
-    "LGA_Terminal_C": 920,
+    "EWR_A_Wide":   810,
+    "EWR_A_Narrow": 810,
+    "EWR_B_Narrow": 1140,
+    "EWR_C_Wide":   1380,
+    "EWR_C_Narrow": 1380,
 }
 
-# Approximate gate counts per terminal (from BTS/FAA airport facility data).
-# Used by SafeOverridePolicy for terminal-specific capacity repair.
-TERMINAL_CAPACITY: Dict[str, int] = {
-    "EWR_Terminal_A": 25,   # mixed-use domestic
-    "EWR_Terminal_B": 22,   # international
-    "EWR_Terminal_C": 45,   # United hub
-    "LGA_Terminal_B": 35,   # new Delta/AA terminal
-    "LGA_Terminal_C": 12,   # smaller concourse
+# Ground taxi speed used to convert distance → time (conservative 12 km/h)
+TAXI_SPEED_M_PER_MIN: float = 200.0
+
+# Total NB-equivalent slots per gate class
+GATE_SLOTS: Dict[str, int] = {
+    "EWR_A_Wide":   8,   # 4 physical gates × 2 slots each
+    "EWR_A_Narrow": 29,
+    "EWR_B_Narrow": 9,
+    "EWR_C_Wide":   4,   # 2 physical gates × 2 slots each
+    "EWR_C_Narrow": 55,
 }
 
+# True for gate-class indices that are narrow (cannot serve widebody aircraft)
+IS_NARROW_GATE: List[bool] = [False, True, True, False, True]  # indices 0-4
 
 
 # ---------------------------------------------------------------------------
 # Gate Masker — structural feasibility enforcement (not a loss)
 # ---------------------------------------------------------------------------
 
+# Terminal → gate class indices mapping (for carrier auth lookup)
+_TERMINAL_TO_GATE_INDICES: Dict[str, List[int]] = {
+    "Terminal_A": [0, 1],  # EWR_A_Wide, EWR_A_Narrow
+    "Terminal_B": [2],     # EWR_B_Narrow
+    "Terminal_C": [3, 4],  # EWR_C_Wide, EWR_C_Narrow
+}
+
+
 class GateMasker(nn.Module):
     """
-    Enforces airline-terminal constraints by masking infeasible gate logits
-    to −∞ before every softmax.  This guarantees zero gate violations by
-    construction — no loss term is needed.
-
-    Parameters
-    ----------
-    gate_mapping_path : str or Path
-    carrier_list : list[str]
+    Enforces airline-terminal + aircraft-type constraints by masking infeasible
+    gate logits to −∞ before every softmax.  EWR-only.
     """
 
     def __init__(self, gate_mapping_path: str, carrier_list: List[str]):
@@ -88,83 +87,61 @@ class GateMasker(nn.Module):
         with open(gate_mapping_path) as fh:
             mapping = json.load(fh)
 
-        airport_order = ["EWR", "LGA"]
         num_carriers = len(carrier_list)
-        gate_to_idx = {g: i for i, g in enumerate(GATE_CLASSES)}
 
-        invalid = torch.zeros(num_carriers, 2, NUM_GATES)
+        # invalid[carrier_idx, gate_idx] = 1 if carrier cannot use that gate class
+        invalid = torch.zeros(num_carriers, NUM_GATES)
 
-        for ap_idx, airport in enumerate(airport_order):
-            if airport not in mapping:
-                continue
-            authorised: Dict[int, set] = {}
-            for terminal, carriers in mapping[airport].items():
-                gate_key = f"{airport}_{terminal}"
-                if gate_key not in gate_to_idx:
-                    continue
-                g_idx = gate_to_idx[gate_key]
-                for carrier in carriers:
-                    if carrier in carrier_list:
-                        c_idx = carrier_list.index(carrier)
-                        authorised.setdefault(c_idx, set()).add(g_idx)
+        ewr_mapping = mapping.get("EWR", {})
+        authorised: Dict[int, set] = {}
+        for terminal_name, carriers in ewr_mapping.items():
+            gate_indices = _TERMINAL_TO_GATE_INDICES.get(terminal_name, [])
+            for carrier in carriers:
+                if carrier in carrier_list:
+                    c_idx = carrier_list.index(carrier)
+                    authorised.setdefault(c_idx, set()).update(gate_indices)
 
-            all_gate_indices = set(range(NUM_GATES))
-            for c_idx, valid_gates in authorised.items():
-                for g_idx in all_gate_indices - valid_gates:
-                    invalid[c_idx, ap_idx, g_idx] = 1.0
+        all_gate_indices = set(range(NUM_GATES))
+        for c_idx, valid_gates in authorised.items():
+            for g_idx in all_gate_indices - valid_gates:
+                invalid[c_idx, g_idx] = 1.0
 
-        # Cross-airport: EWR flights must not use LGA terminals and vice-versa
-        ewr_gate_ids = [0, 1, 2]
-        lga_gate_ids = [3, 4]
-        for c_idx in range(num_carriers):
-            for g in lga_gate_ids:
-                invalid[c_idx, 0, g] = 1.0
-            for g in ewr_gate_ids:
-                invalid[c_idx, 1, g] = 1.0
-
-        self.register_buffer("invalid", invalid)
+        self.register_buffer("carrier_invalid", invalid)   # [C, G]
+        # Boolean mask: True for narrow gate classes
+        narrow_mask = torch.tensor(IS_NARROW_GATE, dtype=torch.bool)
+        self.register_buffer("narrow_gate_mask", narrow_mask)  # [G]
         self.carrier_list = carrier_list
-
-    def _per_flight_invalid_mask(
-        self,
-        carrier_ohe: torch.Tensor,  # [N, C]
-        is_lga: torch.Tensor,       # [N]
-    ) -> torch.Tensor:              # [N, G]
-        per_flight_inv = torch.einsum("nc,cag->nag", carrier_ohe.float(), self.invalid)
-        ap_idx     = is_lga.long().clamp(0, 1)
-        ap_idx_exp = ap_idx.view(-1, 1, 1).expand(-1, 1, NUM_GATES)
-        return per_flight_inv.gather(1, ap_idx_exp).squeeze(1)
 
     def mask_logits(
         self,
-        gate_logits: torch.Tensor,  # [N, G]
-        carrier_ohe: torch.Tensor,  # [N, C]
-        is_lga: torch.Tensor,       # [N]
-    ) -> torch.Tensor:              # [N, G]
+        gate_logits: torch.Tensor,   # [N, G]
+        carrier_ohe: torch.Tensor,   # [N, C]
+        is_widebody: torch.Tensor,   # [N]  float: 1 = widebody
+    ) -> torch.Tensor:               # [N, G]
         """Set infeasible gate logits to −∞ (hard constraint, differentiable)."""
-        inv_mask = self._per_flight_invalid_mask(carrier_ohe, is_lga)
-        valid    = inv_mask < 0.5
+        # Carrier-level infeasibility: [N, C] @ [C, G] → [N, G]
+        carrier_inv = carrier_ohe.float() @ self.carrier_invalid
+        valid = carrier_inv < 0.5
+
+        # Widebody aircraft cannot use narrow gate classes
+        narrow = self.narrow_gate_mask.unsqueeze(0)        # [1, G]
+        is_wide = is_widebody.bool().unsqueeze(1)          # [N, 1]
+        valid = valid & ~(is_wide & narrow)
 
         # Fallback: if every gate is masked for a flight, allow all gates
-        # (avoids softmax NaN for carriers with no valid terminal at this airport)
-        has_valid = valid.any(dim=-1, keepdim=True)
-        valid     = valid | ~has_valid
+        valid = valid | ~valid.any(dim=-1, keepdim=True)
 
-        neg_inf = torch.full_like(gate_logits, float("-inf"))
-        return torch.where(valid, gate_logits, neg_inf)
+        return torch.where(valid, gate_logits, torch.full_like(gate_logits, float("-inf")))
 
 
 # ---------------------------------------------------------------------------
-# F2 – Taxiing Distance Loss
+# L_taxi — Differentiable expected taxi time  E[T_taxi]
 # ---------------------------------------------------------------------------
 
 class TaxiingDistanceLoss(nn.Module):
     """
-    Differentiable expected taxiing distance.
-
-    Uses APPROX_DIST_M (hardcoded realistic values in metres), matching
-    the distances used by baseline.py for direct apples-to-apples comparison.
-    Multiply the returned normalised loss by 1380.0 to recover metres.
+    E[T_taxi] = softmax(gate_logits) · time_vec
+    Returns expected taxi time in minutes.
     """
 
     def __init__(self):
@@ -172,18 +149,18 @@ class TaxiingDistanceLoss(nn.Module):
         raw = torch.tensor(
             [APPROX_DIST_M[g] for g in GATE_CLASSES], dtype=torch.float32
         )
-        self.register_buffer("dist_vec", raw / (raw.max() + 1e-8))
+        self.register_buffer("time_vec", raw / TAXI_SPEED_M_PER_MIN)
 
     def forward(
         self,
         gate_logits: torch.Tensor,
-        is_at_nyc: Optional[torch.Tensor] = None,
+        is_at_ewr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         gate_probs = torch.softmax(gate_logits, dim=-1)
-        expected   = (gate_probs * self.dist_vec).sum(dim=-1)
+        expected   = (gate_probs * self.time_vec).sum(dim=-1)
 
-        if is_at_nyc is not None:
-            mask     = is_at_nyc.float()
+        if is_at_ewr is not None:
+            mask     = is_at_ewr.float()
             n_active = mask.sum().clamp(min=1.0)
             return (expected * mask).sum() / n_active
 
@@ -191,93 +168,68 @@ class TaxiingDistanceLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# F3 – Schedule Stability Loss (delay-risk proxy)
+# L_cong — Differentiable soft congestion proxy  E[T_queue_soft]
 # ---------------------------------------------------------------------------
 
-class ScheduleStabilityLoss(nn.Module):
+class SoftCongestionLoss(nn.Module):
     """
-    Differentiable approximation of P(departure delay > 15 min).
+    Differentiable proxy for queueing delay, weighted by aircraft slot consumption:
 
-        F3 = mean(sigmoid((delay_pred − 15) / 5))
+        E[T_queue_soft] = (1/M) Σ_i Σ_j exp(-|t_i - t_j| / τ) × (p_i · p_j) × units_i × units_j
 
-    The sigmoid "temperature" of 5 min gives a soft threshold: flights
-    predicted at 15 min delay contribute 0.5, well below contribute ~0,
-    well above contribute ~1.  Output is always in (0, 1).
-    """
+    where p_i · p_j = dot(gate_probs_i, gate_probs_j) = P(same gate class).
+    Widebody flights (units=2) contribute 4× more congestion than narrowbodies (units=1).
 
-    def forward(self, delay_pred: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid((delay_pred - 15.0) / 5.0).mean()
-
-
-# ---------------------------------------------------------------------------
-# Entropy regularisation — prevents gate-head mode collapse
-# ---------------------------------------------------------------------------
-
-class EntropyRegularization(nn.Module):
-    """
-    Entropy penalty: minimising H pushes the model toward confident,
-    peaked gate assignments rather than uniform distributions.
-
-    Loss = mean_entropy(softmax(gate_logits))  [higher = more uniform = worse]
+    Parameters
+    ----------
+    tau : float
+        Temporal kernel bandwidth in minutes (default 30).
     """
 
-    def forward(self, gate_logits: torch.Tensor) -> torch.Tensor:
-        log_probs = torch.log_softmax(gate_logits, dim=-1)
-        probs     = torch.softmax(gate_logits, dim=-1)
-        log_probs_safe = log_probs.clamp(min=-100.0)
-        entropy   = -(probs * log_probs_safe).sum(dim=-1).mean()
-        return entropy   # minimising → peaked (confident) predictions
-
-
-# ---------------------------------------------------------------------------
-# Load-balancing regularisation — discourages temporal overloading
-# ---------------------------------------------------------------------------
-
-class LoadBalancingLoss(nn.Module):
-    """
-    Penalise high variance of expected gate load within each 30-min
-    departure bucket in the batch.  Differentiable via gate_probs.
-
-    NOTE: Use a small delta (≤ 0.05) or 0.0.  Minimising load std pushes
-    gate_probs toward uniform (max-entropy = min-variance), which fights the
-    F2 gradient.  A better future design would penalise load ABOVE a
-    per-terminal capacity threshold rather than minimising variance.
-    """
+    def __init__(self, tau: float = 30.0):
+        super().__init__()
+        self.tau = tau
 
     def forward(
         self,
-        gate_probs: torch.Tensor,   # [N, G]  after masked softmax
-        dep_bucket: torch.Tensor,   # [N]     CRS_DEP_TIME // 30
+        gate_probs: torch.Tensor,      # [N, G]
+        dep_time_min: torch.Tensor,    # [N]
+        is_at_ewr: torch.Tensor,       # [N]  float: 1 = EWR flight
+        aircraft_slots: torch.Tensor,  # [N]  float: 2.0 = widebody, 1.0 = narrowbody
     ) -> torch.Tensor:
-        unique_buckets = dep_bucket.unique()
-        stds = []
-        for b in unique_buckets:
-            mask = dep_bucket == b
-            if mask.sum() < 2:
-                continue
-            expected_load = gate_probs[mask].sum(dim=0)  # [G]
-            stds.append(expected_load.std())
-        if not stds:
+        ewr = is_at_ewr.bool()
+        if ewr.sum() < 2:
             return gate_probs.new_tensor(0.0)
-        return torch.stack(stds).mean()
+        p     = gate_probs[ewr]                                  # [M, G]
+        t     = dep_time_min[ewr].float()                        # [M]
+        units = aircraft_slots[ewr].float()                      # [M]
+        dt    = (t.unsqueeze(0) - t.unsqueeze(1)).abs()          # [M, M]
+        w     = torch.exp(-dt / self.tau)                        # [M, M]
+        st    = p @ p.T                                          # [M, M] same-class prob
+        # Weight by product of slot sizes: heavier aircraft create more congestion
+        u_sq  = units.unsqueeze(0) * units.unsqueeze(1)          # [M, M]
+        return (w * u_sq * st).mean()
 
 
 # ---------------------------------------------------------------------------
-# Auxiliary: supervised delay regression loss
+# L_turn — Turnaround smoothness regulariser
 # ---------------------------------------------------------------------------
 
-class DelayRegressionLoss(nn.Module):
-    """Huber loss between predicted and observed departure delay (normalised)."""
+class TurnaroundSmoothnessLoss(nn.Module):
+    """
+    Symmetric squared-difference regulariser for consecutive-aircraft pairs.
+    Flights can recover delay after turnaround — NOT a monotonic constraint.
+    """
 
     def forward(
         self,
         delay_pred: torch.Tensor,
-        delay_true: torch.Tensor,
-        delay_scale: float = 30.0,
+        turn_src: torch.Tensor,
+        turn_dst: torch.Tensor,
     ) -> torch.Tensor:
-        pred_s = delay_pred / delay_scale
-        true_s = delay_true.float() / delay_scale
-        return F.huber_loss(pred_s, true_s, delta=1.0)
+        if turn_src.numel() == 0:
+            return delay_pred.new_tensor(0.0)
+        return ((delay_pred[turn_src] - delay_pred[turn_dst]) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -286,94 +238,105 @@ class DelayRegressionLoss(nn.Module):
 
 class MultiObjectiveLoss(nn.Module):
     """
-    L = β·F2 + γ·F3 + λ·L_reg + ε·(–H)
+    L = β·L_taxi  +  λ·L_cong  +  γ·L_turn
 
-    Gate feasibility is enforced structurally (GateMasker) — not as a loss.
+    Gate feasibility enforced structurally via GateMasker (carrier auth + aircraft type).
 
     Parameters
     ----------
     gate_mapping_path : str
-    ewr_graphml, lga_graphml : str
     carrier_list : list[str]
-    alpha : float
-        Retained for CLI backward-compatibility; ignored internally.
-    beta, gamma : float
-        Pareto trade-off weights for F2 and F3.
-    lam : float
-        Weight of the auxiliary delay regression loss.
-    delay_scale : float
-        Reference delay (minutes) used to normalise L_reg.
-    entropy_weight : float
-        Weight of the entropy penalty –H.
+    beta : float   — L_taxi weight
+    lam  : float   — L_cong weight
+    gamma: float   — L_turn weight
+    tau  : float   — SoftCongestionLoss bandwidth (minutes)
     """
 
     def __init__(
         self,
         gate_mapping_path: str,
         carrier_list: List[str],
-        alpha: float = 0.0,   # kept for CLI compat; not used
         beta: float = 1.0,
-        gamma: float = 1.0,
-        lam: float = 0.1,
-        delay_scale: float = 30.0,
+        lam: float = 0.5,
+        gamma: float = 0.05,
+        tau: float = 30.0,
+        # Legacy params accepted but ignored
+        alpha: float = 0.0,
+        delta: float = 0.0,
         entropy_weight: float = 0.0,
-        delta: float = 0.5,
-        # Legacy graphml params accepted but ignored (distances now from APPROX_DIST_M)
+        delay_scale: float = 30.0,
         ewr_graphml: str = "",
         lga_graphml: str = "",
     ):
         super().__init__()
-        self.beta           = beta
-        self.gamma          = gamma
-        self.lam            = lam
-        self.delay_scale    = delay_scale
-        self.entropy_weight = entropy_weight
-        self.delta          = delta
+        self.beta  = beta
+        self.lam   = lam
+        self.gamma = gamma
 
-        self.masker  = GateMasker(gate_mapping_path, carrier_list)
-        self.f2      = TaxiingDistanceLoss()
-        self.f3      = ScheduleStabilityLoss()
-        self.l_reg   = DelayRegressionLoss()
-        self.entropy = EntropyRegularization()
-        self.lb      = LoadBalancingLoss()
+        self.masker = GateMasker(gate_mapping_path, carrier_list)
+        self.f2     = TaxiingDistanceLoss()
+        self.cong   = SoftCongestionLoss(tau=tau)
+        self.turn   = TurnaroundSmoothnessLoss()
 
     def forward(
         self,
-        gate_logits: torch.Tensor,              # [N, 5]
-        delay_pred: torch.Tensor,               # [N]
-        delay_true: torch.Tensor,               # [N]
-        carrier_ohe: torch.Tensor,              # [N, C]
-        is_lga: torch.Tensor,                   # [N]  float: 1 = LGA, 0 = EWR
-        is_at_nyc: torch.Tensor,                # [N]  float: 1 = flight uses EWR or LGA
-        dep_bucket: Optional[torch.Tensor] = None,  # [N]  CRS_DEP_TIME // 30
+        gate_logits: torch.Tensor,    # [N, 5]
+        delay_pred: torch.Tensor,     # [N]
+        delay_true: torch.Tensor,     # [N]  (unused in loss; kept for compat)
+        carrier_ohe: torch.Tensor,    # [N, C]
+        is_at_ewr: torch.Tensor,      # [N]  float: 1 = EWR flight
+        is_widebody: torch.Tensor,    # [N]  float: 1 = widebody aircraft
+        dep_time_min: torch.Tensor,   # [N]  departure time in minutes
+        turn_src: torch.Tensor,       # [E]
+        turn_dst: torch.Tensor,       # [E]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
         -------
-        total  : scalar – combined back-prop loss
-        f2     : scalar – expected normalised taxi distance  [0, 1]
-        f3     : scalar – delay-risk proxy P(delay > 15 min) [0, 1]
-        f3_raw : scalar – mean positive delay in raw minutes (logging only)
+        total     : scalar
+        loss_taxi : scalar – expected taxi time (minutes)
+        loss_cong : scalar – soft congestion proxy
+        loss_turn : scalar – turnaround smoothness
         """
-        # Structural feasibility: infeasible gate logits → −∞
-        masked_logits = self.masker.mask_logits(gate_logits, carrier_ohe, is_lga)
+        masked_logits = self.masker.mask_logits(gate_logits, carrier_ohe, is_widebody)
         gate_probs    = F.softmax(masked_logits, dim=-1)
 
-        loss_f2    = self.f2(masked_logits, is_at_nyc)
-        loss_f3    = self.f3(delay_pred)
-        loss_reg   = self.l_reg(delay_pred, delay_true, self.delay_scale)
-        loss_ent   = self.entropy(masked_logits)
-        loss_lb    = (self.lb(gate_probs, dep_bucket)
-                      if dep_bucket is not None
-                      else masked_logits.new_tensor(0.0))
-
-        total = (
-            self.beta             * loss_f2
-            + self.gamma          * loss_f3
-            + self.lam            * loss_reg
-            + self.entropy_weight * loss_ent
-            + self.delta          * loss_lb
+        aircraft_slots = torch.where(
+            is_widebody.bool(),
+            gate_probs.new_tensor(2.0),
+            gate_probs.new_tensor(1.0),
         )
 
-        f3_raw = F.relu(delay_pred).mean()
-        return total, loss_f2, loss_f3, f3_raw
+        loss_taxi = self.f2(masked_logits, is_at_ewr)
+        loss_cong = self.cong(gate_probs, dep_time_min, is_at_ewr, aircraft_slots)
+        loss_turn = self.turn(delay_pred, turn_src, turn_dst)
+
+        total = (
+            self.beta  * loss_taxi
+            + self.lam   * loss_cong
+            + self.gamma * loss_turn
+        )
+        return total, loss_taxi, loss_cong, loss_turn
+
+
+# ---------------------------------------------------------------------------
+# TAXI_OUT noise calibration helper (called once; not used during training)
+# ---------------------------------------------------------------------------
+
+def calibrate_noise_sigma(
+    taxi_out_arr: "np.ndarray",
+    assignments: "np.ndarray",
+    unassigned_val: int = -1,
+) -> float:
+    """std(TAXI_OUT − T_taxi_physics) for assigned EWR flights."""
+    import numpy as np
+    valid = assignments != unassigned_val
+    if valid.sum() == 0:
+        return 0.0
+    t_physics = np.array(
+        [APPROX_DIST_M[GATE_CLASSES[int(a)]] / TAXI_SPEED_M_PER_MIN
+         for a in assignments[valid]],
+        dtype=np.float32,
+    )
+    taxi_out_valid = np.asarray(taxi_out_arr, dtype=np.float32)[valid]
+    return float(np.nanstd(taxi_out_valid - t_physics))
