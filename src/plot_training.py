@@ -98,9 +98,23 @@ def main():
         ax_taxi, epochs,
         hist["train_taxi"], hist["val_taxi"],
         _C_TAXI,
-        "L_taxi  —  E[Taxi Time]\n(minutes to runway, lower = shorter taxi)",
+        "L_taxi  —  E[Taxi Time]  [minutes, same scale as hard sim]",
         "E[T_taxi] (min)",
     )
+    # Draw hard-sim baseline reference line if policy_comparison.csv exists
+    if COMP_CSV.exists():
+        try:
+            _comp = pd.read_csv(COMP_CSV)
+            _base_row = _comp[_comp["policy"].str.contains("Greedy", case=False)]
+            if not _base_row.empty:
+                _base_taxi = float(_base_row.iloc[0]["f3_taxi_min"])
+                ax_taxi.axhline(
+                    _base_taxi, color="red", ls=":", lw=1.4,
+                    label=f"Baseline hard-sim ({_base_taxi:.2f} min)",
+                )
+                ax_taxi.legend(fontsize=7)
+        except Exception:
+            pass
 
     # ── Panel C: L_cong ──────────────────────────────────────────────────────
     _loss_panel(
@@ -232,8 +246,8 @@ def main():
         ax_comp.set_ylabel("Simulated delay (min)", fontsize=9)
         ax_comp.set_title(
             "Policy Comparison — F3 Hard-Simulator Queueing Metrics  "
-            "(GreedyCapacityAware baseline  vs  GNN π*)\n"
-            "Lower total = better",
+            "(Baseline  |  GNN Greedy  |  GNN + Safe Override)\n"
+            "Lower total = better  |  L_taxi (training) is in the same unit as F3 taxi",
             fontweight="bold", fontsize=10,
         )
         ax_comp.legend(fontsize=8, loc="upper right")

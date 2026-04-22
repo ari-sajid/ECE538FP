@@ -692,6 +692,9 @@ def main():
     # ── Training loop with early stopping on val loss ─────────────────────
     print("=" * 106)
     print("Constrained GNN Scheduler  |  gate masking enforced structurally (not as loss)")
+    print("  L_taxi is in MINUTES (same scale as hard-sim taxi time).")
+    print("  L_cong and L_fill are dimensionless differentiable proxies for queue/density delay.")
+    print("  Weights beta/lam/eta control relative importance; hard-sim comparison is at end.")
     print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-Taxi':>8}  {'Tr-Cong':>8}  {'Tr-Fill':>8}"
           f"  {'VaLoss':>8}  {'Va-Taxi':>8}  {'Va-Cong':>8}  {'Va-Fill':>8}  {'*':>2}")
     print("=" * 106)
@@ -815,20 +818,35 @@ def main():
         model, test_loader, criterion, device, carrier_ohe
     )
 
-    ordered_probs = np.full((len(test_df), NUM_GATES), 1.0 / NUM_GATES, dtype=np.float32)
+    # Map loader-local IDs back to test_df row indices.
+    # Guard against size mismatch between preprocessed CSV and raw CSV.
+    n_test_df = len(test_df)
+    ordered_probs = np.full((n_test_df, NUM_GATES), 1.0 / NUM_GATES, dtype=np.float32)
     for i, local_id in enumerate(seed_ids_np):
-        ordered_probs[int(local_id)] = gate_probs_np[i]
+        li = int(local_id)
+        if 0 <= li < n_test_df:
+            ordered_probs[li] = gate_probs_np[i]
 
-    carriers        = test_df["OP_UNIQUE_CARRIER"].values
-    airports        = np.where(test_df["ORIGIN"] == "EWR", "EWR", None)
-    widebody_test   = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index)).fillna(0).values
-    fl_dates_min    = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
-    dep_min_of_day  = ((test_df["CRS_DEP_TIME"].values // 100) * 60
-                       + (test_df["CRS_DEP_TIME"].values % 100))
+    carriers       = test_df["OP_UNIQUE_CARRIER"].values
+    airports       = np.where(test_df["ORIGIN"] == "EWR", "EWR", None)
+    widebody_test  = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index)).fillna(0).values
+    fl_dates_min   = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
+    dep_min_of_day = ((test_df["CRS_DEP_TIME"].values // 100) * 60
+                      + (test_df["CRS_DEP_TIME"].values % 100))
     dep_times = (fl_dates_min + dep_min_of_day).astype(np.int64)
 
-    # Apply safe override with real model gate probabilities
-    override_policy  = SafeOverridePolicy()
+    is_ewr_arr = airports == "EWR"
+
+    # ── Policy 2: Pure GNN greedy (argmax of masked probs, no override) ──────
+    # Shows what the raw GNN assigns without any safety filtering.
+    gnn_pure_assigns = base_assigns.copy()
+    gnn_pure_assigns[is_ewr_arr] = (
+        ordered_probs[is_ewr_arr].argmax(axis=-1).astype(np.int8)
+    )
+    gnn_pure_metrics = base_policy.score(gnn_pure_assigns, test_df)
+
+    # ── Policy 3: GNN + Safe Override (confidence filter + capacity repair) ──
+    override_policy = SafeOverridePolicy()
     final_assigns, decision_log, override_stats = override_policy.apply(
         ordered_probs, base_assigns, carriers, airports, dep_times, widebody_test
     )
@@ -837,26 +855,27 @@ def main():
     def _pct(new, old):
         return f"{(new - old) / max(abs(old), 1e-9) * 100:>+7.1f}%"
 
-    # Print comparison table (GreedyCapacityAware | GNN π*)
-    print(f"\n  {'Metric':<35} {'Baseline':>10}  {'GNN pi*':>10}  {'Delta':>8}")
-    print("  " + "-" * 68)
-
+    # Print 3-way comparison table
+    print(f"\n  {'Metric':<30} {'Baseline':>9}  {'GNN Greedy':>10}  {'GNN+Override':>12}  {'Delta (OR)':>10}")
+    print("  " + "-" * 78)
     for key, label in [
-        ("f3_taxi_min",  "F3 taxi time (min)    "),
-        ("f3_queue_min", "F3 queue wait (min)   "),
-        ("f3_total_min", "F3 total delay (min)  "),
+        ("f3_taxi_min",  "F3 taxi time (min)   "),
+        ("f3_queue_min", "F3 queue wait (min)  "),
+        ("f3_total_min", "F3 total delay (min) "),
     ]:
         bv = base_metrics[key]
+        gv = gnn_pure_metrics[key]
         ov = override_metrics[key]
-        print(f"  {label:<35} {bv:>10.2f}  {ov:>10.2f}  {_pct(ov, bv):>8}")
+        print(f"  {label:<30} {bv:>9.2f}  {gv:>10.2f}  {ov:>12.2f}  {_pct(ov, bv):>10}")
 
     n = override_stats["n_total"]
     pct_stat = lambda k: f"{100 * override_stats[k] / max(n, 1):.1f}%"
-    print(f"\n  Accepted by GNN          : {override_stats['n_accepted_gnn']:,} ({pct_stat('n_accepted_gnn')})")
-    print(f"  Low confidence (baseline): {override_stats['n_low_confidence']:,} ({pct_stat('n_low_confidence')})")
-    print(f"  Capacity repaired        : {override_stats['n_capacity_repaired']:,}")
-    print(f"  Mean gate confidence     : {override_stats['mean_confidence']:.3f}")
-    print(f"  Conf threshold           : {override_stats['conf_threshold']}")
+    print(f"\n  GNN accepted (conf>={override_stats['conf_threshold']}) : "
+          f"{override_stats['n_accepted_gnn']:,} ({pct_stat('n_accepted_gnn')})")
+    print(f"  Low confidence (kept baseline)  : "
+          f"{override_stats['n_low_confidence']:,} ({pct_stat('n_low_confidence')})")
+    print(f"  Capacity repaired               : {override_stats['n_capacity_repaired']:,}")
+    print(f"  Mean gate confidence            : {override_stats['mean_confidence']:.3f}")
 
     # Save outputs
     decision_log.to_csv(OUT_DIR / "safe_override_decisions.csv", index=False)
@@ -865,7 +884,11 @@ def main():
          "f3_taxi_min": base_metrics["f3_taxi_min"],
          "f3_queue_min": base_metrics["f3_queue_min"],
          "f3_total_min": base_metrics["f3_total_min"]},
-        {"policy": "GNN Safe Override",
+        {"policy": "GNN Greedy",
+         "f3_taxi_min": gnn_pure_metrics["f3_taxi_min"],
+         "f3_queue_min": gnn_pure_metrics["f3_queue_min"],
+         "f3_total_min": gnn_pure_metrics["f3_total_min"]},
+        {"policy": "GNN + Safe Override",
          "f3_taxi_min": override_metrics["f3_taxi_min"],
          "f3_queue_min": override_metrics["f3_queue_min"],
          "f3_total_min": override_metrics["f3_total_min"]},
