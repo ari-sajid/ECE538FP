@@ -81,8 +81,9 @@ FALLBACK_GATE = {
 # Queueing simulation constants
 # ---------------------------------------------------------------------------
 TAXI_SPEED_M_PER_MIN   = 200.0   # ~12 km/h conservative ground speed
-MIN_TURNAROUND_MIN     = 45.0    # gate occupied this long before next departure
-GATE_OCCUPY_WINDOW_MIN = 120.0   # total gate occupancy window per flight
+MIN_TURNAROUND_MIN     = 45.0    # gate slot requested this many min before departure
+GATE_OCCUPY_WINDOW_MIN = 60.0    # total slot hold time per flight (45 min pre-dep + 15 min cleanup)
+                                  # ρ_peak = 70 ops/hr / (105 slots × 1/hr) = 0.67 < 1  ✓
 
 # Density-delay constants: planes parked near each other reduce maneuvering speed.
 # Extra delay = DENSITY_FACTOR * max(0, fill_ratio - DENSITY_THRESHOLD)^2
