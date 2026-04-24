@@ -39,12 +39,10 @@ _C_CONG  = "#ff7f0e"   # orange — congestion
 _C_FILL  = "#9467bd"   # purple — fill density penalty
 
 
-def _loss_panel(ax, epochs, train_vals, val_vals, colour, title, ylabel):
+def _loss_panel(ax, epochs, val_vals, colour, title, ylabel):
     """Shared helper: train/val curve with shaded gap."""
-    ax.plot(epochs, train_vals, color=colour, lw=2,       label="Train")
     ax.plot(epochs, val_vals,   color=colour, lw=2, ls="--",
-            alpha=0.75, label="Val")
-    ax.fill_between(epochs, train_vals, val_vals, alpha=0.08, color=colour)
+            alpha=0.75, label="Validation Loss")
     ax.set_title(title, fontweight="bold", fontsize=10)
     ax.set_xlabel("Epoch", fontsize=9)
     ax.set_ylabel(ylabel, fontsize=9)
@@ -87,7 +85,7 @@ def main():
     # ── Panel A: Total loss ──────────────────────────────────────────────────
     _loss_panel(
         ax_loss, epochs,
-        hist["train_loss"], hist["val_loss"],
+        hist["val_loss"],
         _C_LOSS,
         "Total Loss\n(β·L_taxi + λ·L_cong + η·L_fill + γ·L_turn)",
         "Loss",
@@ -96,7 +94,7 @@ def main():
     # ── Panel B: L_taxi ──────────────────────────────────────────────────────
     _loss_panel(
         ax_taxi, epochs,
-        hist["train_taxi"], hist["val_taxi"],
+        hist["val_taxi"],
         _C_TAXI,
         "L_taxi  —  E[Taxi Time]  [minutes, same scale as hard sim]",
         "E[T_taxi] (min)",
@@ -119,18 +117,32 @@ def main():
     # ── Panel C: L_cong ──────────────────────────────────────────────────────
     _loss_panel(
         ax_cong, epochs,
-        hist["train_cong"], hist["val_cong"],
+        hist["val_cong"],
         _C_CONG,
-        "L_cong  —  Soft Congestion Proxy\n(temporal-kernel × same-zone probability)",
+        "L_cong  —  Soft Congestion Loss Proxy",
         "L_cong",
     )
+    # Draw hard-sim baseline reference line if policy_comparison.csv exists
+    if COMP_CSV.exists():
+        try:
+            _comp = pd.read_csv(COMP_CSV)
+            _base_row = _comp[_comp["policy"].str.contains("Greedy", case=False)]
+            if not _base_row.empty:
+                _base_taxi = float(_base_row.iloc[0]["f3_queue_min"])
+                ax_cong.axhline(
+                    _base_taxi, color="red", ls=":", lw=1.4,
+                    label=f"Baseline hard-sim ({_base_taxi:.2f} min)",
+                )
+                ax_cong.legend(fontsize=7)
+        except Exception:
+            pass
 
     # ── Panel D: L_fill ──────────────────────────────────────────────────────
     has_fill = "train_fill" in hist.columns and "val_fill" in hist.columns
     if has_fill:
         _loss_panel(
             ax_fill, epochs,
-            hist["train_fill"], hist["val_fill"],
+            hist["val_fill"],
             _C_FILL,
             "L_fill  —  Gate-Zone Density Penalty\n(quadratic in fill ratio above 30% threshold)",
             "L_fill",
