@@ -1,52 +1,48 @@
-# ECE538FP — Spatio-Temporal GNN for Airport Gate Scheduling
+# ECE538FP — Spatio-Temporal GNN for EWR Gate Scheduling
 
-A Graph Neural Network system that optimises gate and terminal assignments for
-flights at Newark (EWR) and LaGuardia (LGA) airports, simultaneously minimising
-three competing objectives: terminal-constraint violations, taxiing distance, and
-schedule instability.
+A Graph Neural Network system that optimises gate-class assignments for
+departure flights at Newark Liberty International Airport (EWR), simultaneously
+minimising taxi time, soft congestion, and gate-zone density — subject to hard
+carrier-terminal and aircraft-type feasibility constraints.
 
 ---
 
 ## Motivation
 
-Gate scheduling at busy metropolitan airports is a combinatorial optimisation
-problem with thousands of interdependent flights, strict airline-terminal
-agreements, and real-time weather disruptions.  Classical solvers struggle to
-scale and cannot easily incorporate the rich relational structure of a flight
-network.  This project applies a **Heterogeneous Spatio-Temporal GNN** to learn
-gate assignments end-to-end from one full year of Bureau of Transportation
-Statistics (BTS) flight data, enriched with hourly ASOS weather observations and
-OpenStreetMap airport-layout graphs.
+Gate scheduling at busy airports is a combinatorial optimisation problem with
+strict airline–terminal contracts, physical aircraft-type limits (widebody vs
+narrowbody), and thousands of interdependent flights per day.  Classical
+rule-based schedulers are fast but ignore load-balancing and temporal
+congestion dynamics.  This project trains a **Heterogeneous Spatio-Temporal
+GNN** end-to-end from a full year of BTS flight records to learn gate
+assignments that improve on a strong greedy baseline.
 
 ---
 
 ## System Overview
 
-The project implements a **three-tier scheduling pipeline**:
-
 ```
-512k Flight Records
-        │
-        ▼
-┌───────────────────┐    π₀ ranking    ┌──────────────────────┐    proposals
-│  Tier 1           │ ───────────────► │  Tier 2              │ ──────────────►
-│  Greedy First-Fit │                  │  Spatio-Temporal GNN │
-│  Baseline (π₀)    │                  │  GATConv × 3 layers  │
-└───────────────────┘                  └──────────────────────┘
-                                                  │
-                                    Multi-objective loss
-                                    L = α·F1 + β·F2 + γ·F3
-                                                  │
-                                                  ▼
-                                    ┌──────────────────────────┐
-                                    │  Tier 3                  │
-                                    │  Safe Override (π*)      │
-                                    │  KT-guard + F1-feasibility│
-                                    └──────────────────────────┘
-                                                  │
-                                                  ▼
-                                         Final Assignment
-                                         + Delay Estimate
+BTS flight records (2025)
+         │
+         ▼
+┌─────────────────────────────┐
+│  finalize_data.py           │  → final_node_features.csv  (node features)
+│  graph_engine.py            │  → edges.csv  (3 edge types)
+└─────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────┐       ┌────────────────────────┐
+│  GreedyCapacityAware  (π₀)  │──────►│  SafeOverridePolicy    │
+│  baselines.py               │       │  (π*)  safe_override.py│
+└─────────────────────────────┘       └────────────────────────┘
+         │                                        ▲
+         │ baseline assignments                   │ GNN proposals
+         │                          ┌─────────────┴──────────┐
+         │                          │  SpatioTemporalGNN (πθ) │
+         └──────────────────────────│  train.py / eval.py     │
+                                    └────────────────────────┘
+                                    Multi-objective loss:
+                                    L = β·L_taxi + λ·L_cong + η·L_fill + γ·L_turn
 ```
 
 ---
@@ -55,33 +51,59 @@ The project implements a **three-tier scheduling pipeline**:
 
 | Source | File | Description |
 |--------|------|-------------|
-| BTS On-Time Performance 2025 | `data/raw/nyc_master_2025.csv` | 512,062 flight records involving EWR or LGA |
-| ASOS Weather (Iowa State) | `data/meta/weather_ewr.csv`, `weather_lga.csv` | Hourly wind, visibility, precipitation |
-| OpenStreetMap (via OSMnx) | `data/geo/ewr_layout.graphml`, `lga_layout.graphml` | Road/taxiway network within 3 km of each airport |
-| Airline-terminal rules | `data/meta/gate_mapping.json` | Maps each carrier to its authorised terminal(s) |
+| BTS On-Time Performance 2025 | `data/raw/nyc_master_2025.csv` | All EWR departures for 2025 |
+| Airline-terminal rules | `data/meta/gate_mapping.json` | Maps each carrier to its authorised EWR terminal(s) |
+| Gate-class metadata | `data/meta/terminal_zones.json` | Dist, slot count, and type per gate class |
 
 ### Processed artefacts (generated by the pipeline)
 
 | File | Description |
 |------|-------------|
-| `data/processed/final_node_features.csv` | 512,061-row, 141-column node feature matrix |
-| `data/processed/edges.csv` | Graph edges: turnaround + congestion |
+| `data/processed/final_node_features.csv` | Per-flight node feature matrix |
+| `data/processed/edges.csv` | Graph edges: turnaround · congestion · same_terminal |
+
+---
+
+## Gate Structure
+
+EWR is modelled at **gate-class granularity** — Wide vs Narrow within each terminal — giving 5 classes:
+
+| Index | Gate Class | Terminal | Physical Gates | NB-equiv Slots | Dist to Runway |
+|-------|-----------|----------|---------------|---------------|----------------|
+| 0 | `EWR_A_Wide`   | A | 4  | 8  | 810 m  |
+| 1 | `EWR_A_Narrow` | A | 29 | 29 | 810 m  |
+| 2 | `EWR_B_Narrow` | B | 9  | 9  | 1,140 m |
+| 3 | `EWR_C_Wide`   | C | 2  | 4  | 1,380 m |
+| 4 | `EWR_C_Narrow` | C | 55 | 55 | 1,380 m |
+
+**Slot model:** a Wide gate holds 1 widebody **or** 2 narrowbodies.
+A widebody aircraft occupies 2 slot-units; a narrowbody occupies 1.
+
+**Feasibility rules:**
+- Widebody aircraft → Wide gate classes only (`EWR_A_Wide`, `EWR_C_Wide`)
+- Narrowbody aircraft → any authorised gate class
+- Carrier authorisation enforced per `gate_mapping.json` at terminal level
 
 ---
 
 ## Graph Structure
 
 ```
-Nodes  :  one per flight record (~512 k)
-          141 features: scheduled time · carrier (OHE) · origin airport (OHE) ·
-                        distance · weather (wind/vis/precip) ·
-                        AT_EWR / AT_LGA binary flags
+Nodes   :  one per flight record (~512 k)
+           Features: scheduled time · carrier (OHE) · origin (OHE) · distance ·
+                     weather (wind/vis/precip) · AT_EWR flag · WIDEBODY flag · …
 
-Edges  :  turnaround  — flight[i] → flight[i+1] for the same aircraft tail number
-                        (encodes downstream delay propagation)
+Edge type 1 — turnaround
+    flight[i] → flight[i+1] for the same aircraft tail number
+    Encodes downstream delay propagation.
 
-          congestion  — pairs of flights at the same airport departing within 15 min
-                        (encodes runway/taxiway contention)
+Edge type 2 — congestion
+    Pairs of EWR departures within a 15-min CRS_DEP_TIME window
+    Encodes runway / taxiway contention.
+
+Edge type 3 — same_terminal
+    EWR departures within 30 min whose carriers share at least one
+    authorised terminal; encodes gate-capacity competition.
 ```
 
 ---
@@ -89,201 +111,226 @@ Edges  :  turnaround  — flight[i] → flight[i+1] for the same aircraft tail n
 ## Model Architecture (`src/model.py`)
 
 ```
-Input features  [N × 141]
+Input features  [N × F_in]
        │
-  Linear projection + LayerNorm + ReLU
+  Linear projection + LayerNorm + ReLU  →  [N × 128]
        │
-  ┌────┴──────────────────────────────────────────┐
-  │  HeteroConv  ×  num_layers  (default 3)        │
-  │   ├─ GATConv (turnaround edges)  ← 4 heads    │
-  │   └─ GATConv (congestion  edges) ← 4 heads    │
-  │   → sum both message streams per node          │
-  │   → residual + LayerNorm + Dropout             │
-  └────────────────────────────────────────────────┘
+  ┌────┴─────────────────────────────────────────────┐
+  │  HeteroConv  × 3 layers                          │
+  │   ├─ GATConv (turnaround edges)    4 heads       │
+  │   ├─ GATConv (congestion edges)    4 heads       │
+  │   └─ GATConv (same_terminal edges) 4 heads       │
+  │   → summed, then residual + LayerNorm + Dropout  │
+  └────────────────────────────────────────────────────┘
        │
   ┌────┴──────────────┐
-  │  gate_head         │   → [N, 5]  terminal logits
-  └───────────────────┘       EWR-A · EWR-B · EWR-C · LGA-B · LGA-C
+  │  gate_head         │  → [N, 5]  logits  (one per gate class)
+  └───────────────────┘
   ┌────┴──────────────┐
-  │  delay_head        │   → [N]     predicted departure delay (minutes)
+  │  delay_head        │  → [N]     predicted departure delay (min)
   └───────────────────┘
 ```
 
-Default hyper-parameters: `hidden=128`, `layers=3`, `dropout=0.3`, `heads=4`.
-
-**Architecture notes:**
-- Uses `GATConv` (Graph Attention Network) — upgraded from SAGEConv — so the
-  model learns to weight neighbours differently (e.g. a late-running connecting
-  flight receives more attention than an on-time one).
-- `head_dim = hidden_channels // num_heads` ensures `concat=True` preserves
-  the hidden dimension across all residual connections.
+Default hyper-parameters: `hidden=128`, `layers=3`, `heads=4`, `dropout=0.2`.
 
 ---
 
 ## Loss Functions (`src/loss.py`)
 
-The model is trained on a **multi-objective loss**:
-
 ```
-L = α·F1 + β·F2 + γ·F3 + λ·L_reg
+L = β·L_taxi  +  λ·L_cong  +  η·L_fill  +  γ·L_turn
 ```
 
-### F1 — Gate Constraint Loss
-Penalises softmax probability mass placed on terminals that violate
-`gate_mapping.json`.  Differentiable via the softmax output.
+All components are in **minutes** at convergence, directly comparable to
+hard-simulator output.
 
-### F2 — Taxiing Distance Loss
-Shortest network path (metres) between each terminal and its runway is
-pre-computed once at init via **NetworkX Dijkstra** on the GraphML road graphs.
-During training:
+### L_taxi — Expected Taxi Time (`TaxiingDistanceLoss`)
 ```
-E[dist] = softmax(gate_logits) · precomputed_distance_vector
+E[T_taxi] = softmax(gate_logits) · dist_vec / taxi_speed
+```
+`dist_vec` = `[810, 810, 1140, 1380, 1380]` m; `taxi_speed` = 200 m/min.
+Averaged over EWR flights only.
+
+### L_cong — Soft M/D/K Congestion Proxy (`SoftCongestionLoss`)
+Buckets flights into 30-min windows.  Computes expected slot-unit demand
+per (window, gate class), converts to utilisation ρ, then applies a
+quadratic wait penalty for ρ > 0.85 (calibrated to the hard simulator):
+```
+wait(ρ) = 60 · 10 · max(0, ρ − 0.85)²   [minutes]
+```
+Aircraft slot weighting: widebody contributes 2 units, narrowbody 1.
+
+### L_fill — Gate-Zone Density Penalty (`GateFillPenaltyLoss`)
+Differentiable analog of the hard-sim density term: quadratic penalty when
+fill ratio > 30% in a 60-min window.
+```
+delay(fill) = 8 · max(0, fill_ratio − 0.30)²   [minutes]
 ```
 
-### F3 — Schedule Stability Loss
-```
-F3 = mean( ReLU(delay_pred) )
-```
-Encourages assignments that minimise positive predicted delays.
+### L_turn — Turnaround Smoothness (`TurnaroundSmoothnessLoss`)
+Symmetric squared-difference regulariser on predicted delays for
+consecutive flights of the same aircraft.
 
-### L_reg — Auxiliary Delay Regression
-MSE between the delay head and observed `DEP_DELAY` to keep F3 calibrated.
+### GateMasker (structural, not a loss)
+Sets infeasible gate logits to −∞ before every softmax — enforcing carrier
+authorisation and aircraft-type constraints without any penalty term.
 
 ---
 
 ## Training Pipeline (`src/train.py`)
 
 ### Data split
-| Split | Months | Flights |
-|-------|--------|---------|
-| Train | Jan – Sep 2025 (1–9) | ~360 k |
-| Val   | Oct 2025 (10) | ~52 k |
-| Test  | Nov – Dec 2025 (11–12) | ~88 k |
+
+| Split | Months | Role |
+|-------|--------|------|
+| Train | Jan – Aug 2025 (1–8) | Gradient updates |
+| Val   | Sep – Oct 2025 (9–10) | Early stopping, Pareto logging |
+| Test  | Nov – Dec 2025 (11–12) | Final evaluation (unseen) |
 
 ### Key features
-- **NeighborLoader** with 2-hop sampling `[10, 5]` for memory-safe mini-batch
-  training on 512 k nodes.
-- **Temporal batching** — seeds sorted by (month, 4-hour window) so mini-batches
-  approximate real scheduling order.
-- **AT_EWR / AT_LGA flags** — binary features derived from both ORIGIN and DEST
-  so arriving flights carry their NYC airport identity without requiring the raw
-  CSV at inference time.
-- **Feature schema** saved alongside each checkpoint (`outputs/feature_schema.json`)
-  so the inference API can reconstruct the exact feature vector ordering.
+
+- **NeighborLoader** with 3-hop sampling `[10, 5, 5]` for memory-safe
+  mini-batch training on 512 k nodes.
+- **Temporal batching** — seed nodes sorted by (month, 4-hour window) so
+  each mini-batch contains flights from the same departure window, giving
+  the GNN coherent congestion clusters.
+- **`is_widebody` tensor** stored as `data["flight"].is_widebody` and
+  propagated through every batch for masking and slot-weighted losses.
+- **Early stopping** with patience=15 on val total loss.
+- **Pareto front** tracking across three val objectives (taxi, cong, fill)
+  logged to `outputs/pareto_front.csv`.
 
 ### CLI flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--hidden_channels` | 128 | GNN hidden layer width |
+| `--hidden_channels` | 128 | GNN hidden width |
 | `--num_layers` | 3 | Message-passing rounds |
 | `--num_heads` | 4 | GAT attention heads |
-| `--dropout` | 0.3 | Dropout probability |
-| `--lr` | 1e-3 | Initial learning rate |
-| `--epochs` | 50 | Training epochs |
+| `--dropout` | 0.2 | Dropout probability |
+| `--lr` | 5e-4 | Initial learning rate |
+| `--epochs` | 100 | Max training epochs |
 | `--batch_size` | 512 | Seed nodes per mini-batch |
-| `--window_hours` | 4 | Temporal window size for seed sorting |
-| `--alpha` | 1.0 | F1 (gate constraint) weight |
-| `--beta` | 1.0 | F2 (taxiing distance) weight |
-| `--gamma` | 1.0 | F3 (schedule stability) weight |
-| `--lam` | 1.0 | Auxiliary regression weight |
+| `--beta` | 1.0 | L_taxi weight |
+| `--lam` | 1.0 | L_cong weight |
+| `--eta` | 1.0 | L_fill weight |
+| `--gamma` | 0.05 | L_turn (smoothness) weight |
+| `--patience` | 15 | Early-stopping epochs |
 
 ---
 
-## Baseline Policy (`src/baseline.py`)
+## Baseline Policy (`src/baselines.py` + `src/baseline.py`)
 
-**Greedy First-Fit (π₀)** — mimics current manual scheduling practice:
+**`GreedyCapacityAware`** — single operational baseline that extends the
+`GreedyFirstFit` first-fit scheduler with load-balancing:
 
-1. Sort flights by `(FL_DATE, CRS_DEP_TIME)`.
-2. For each flight, assign the first valid terminal for its carrier from
-   `gate_mapping.json`.  Unmapped carriers (F9, G4, MQ, NK, OO, YX) fall back
-   to EWR-A or LGA-B depending on their airport.
+```
+score(g) = 0.4 × norm_dist(g)
+         + 0.6 × slot_utilization(g, 30-min bucket)
+         + 0.3  [if narrowbody using a Wide gate class]
+```
 
-### Baseline metrics (full 2025 dataset)
+- Processes flights in chronological order
+- Enforces carrier authorisation and widebody → Wide-only constraint
+- Tracks cumulative slot-unit consumption per (gate, 30-min bucket)
+- Biases narrowbodies toward Narrow gates to preserve Wide capacity
 
-| Metric | Value |
-|--------|-------|
-| F1 gate violations | **0** (0.000%) |
-| F2 mean taxi distance | **764 m** |
-| F3 = mean ReLU(delay) | **20.92 min** |
-| Delay rate (> 15 min) | 23.1% of flights |
-| EWR Terminal C utilisation | **0%** (unused — GNN opportunity) |
-
-Terminal breakdown:
-
-| Terminal | Flights | Approx. distance |
-|----------|---------|-----------------|
-| EWR Terminal A | 234,329 | 810 m |
-| EWR Terminal B | 6,301 | 1,140 m |
-| EWR Terminal C | 0 | 1,350 m |
-| LGA Terminal B | 212,914 | 660 m |
-| LGA Terminal C | 58,517 | 920 m |
+`GreedyFirstFit` (in `baseline.py`) provides the core gate-mapping lookup,
+`simulate_queuing_f3` (M/D/K slot queueing), and the `score()` / `score_soft()`
+evaluation methods used throughout.
 
 ---
 
 ## Safe Override Policy (`src/safe_override.py`)
 
-**π\*** applies a two-stage safety guard on top of any GNN proposal:
+**π\*** applies two safety gates on top of any GNN proposal:
 
-1. **F1 feasibility check** — rejects any flight whose proposed terminal is
-   not authorised for its carrier.
-2. **Kendall-Tau guard** — computes the global KT rank-distance between the
-   full GNN proposal set and the baseline ranking.  If `KT > k_max` (default
-   0.05) the entire batch reverts to baseline.
+1. **Confidence filter** — accepts the GNN's argmax gate assignment only if
+   `max(gate_probs[i]) ≥ conf_threshold` (default 0.3).  Low-confidence
+   flights revert to the baseline assignment.
 
-### Pre-training validation (test split, n = 88,052 flights)
+2. **Capacity repair** — if the accepted GNN gate would exceed the slot-unit
+   budget for its 30-min departure window, the flight is re-assigned to the
+   next-best feasible gate class (respecting aircraft type and carrier auth).
 
-| Stage | Count | % |
-|-------|-------|---|
-| Accepted (GNN proposal) | 0 | 0.0% |
-| Rejected — F1 violation | 39,592 | 45.0% |
-| Rejected — KT guard | 48,460 | 55.0% |
-
-With an untrained (random-weight) GNN, π* correctly reverts **all** assignments
-to the baseline, producing identical F1/F2/F3 metrics.  This confirms the safety
-mechanism: zero constraint violations are introduced and the system degrades
-gracefully until a trained checkpoint is available.
+Aircraft-type feasibility is enforced at every step: widebody aircraft cannot
+be placed on Narrow gate classes even during repair.
 
 ---
 
-## Inference API (`src/api.py`)
+## Evaluation Script (`src/eval.py`)
 
-A FastAPI server wraps the trained model for real-time use.
+Standalone evaluation without retraining:
 
 ```bash
-uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+python -m src.eval [--checkpoint outputs/best_model.pt] [--device cuda]
 ```
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Liveness check; reports model load status |
-| `/gates` | GET | Lists the five terminal classes + approx distances |
-| `/predict` | POST | Gate assignments for a batch of ≤ 500 flights |
+Produces:
+1. **Soft-proxy test metrics** — L_taxi, L_cong, L_fill on the test split
+   using the same mini-batch criterion as training (same numerical scale as
+   val columns).
+2. **Pareto front** — re-computed from `training_history.csv`; saved to
+   `outputs/pareto_front.csv`.
+3. **F3 hard-sim policy comparison** — `GreedyCapacityAware` | `GNN Greedy`
+   | `GNN + Safe Override`; scored with `simulate_queuing_f3` (physically
+   meaningful minutes).
 
-**Fallback behaviour**: if no checkpoint exists the server returns
-`"policy": "baseline"` using Greedy First-Fit.  Turnaround + congestion edges
-are built on-the-fly from the request batch.
+Architecture flags must match the checkpoint defaults.
 
 ---
 
-## Poster Visualisations (`src/plot_poster.py`)
-
-Eight publication-quality panels are generated in `outputs/poster/` (300 DPI):
-
-| File | Content |
-|------|---------|
-| `01_pipeline.png` | Three-tier scheduling pipeline diagram |
-| `02_graph_schema.png` | Heterogeneous graph (turnaround + congestion) |
-| `03_terminal_distribution.png` | Baseline terminal utilisation (EWR-C unused) |
-| `04_delay_distribution.png` | Departure delay histogram; F3 marker |
-| `05_hourly_pattern.png` | Avg departures/hour — EWR vs LGA |
-| `06_safe_override.png` | π* decision breakdown (accepted / F1-reject / KT-reject) |
-| `07_metrics_summary.png` | F1 / F2 / F3 comparison — π₀ vs π* |
-| `08_constraint_matrix.png` | Carrier × terminal authorisation matrix |
+## Training Visualisation (`src/plot_training.py`)
 
 ```bash
-python -m src.plot_poster    # regenerate all panels
+python src/plot_training.py
 ```
+
+Reads `outputs/training_history.csv`, `outputs/pareto_front.csv`, and
+`outputs/policy_comparison.csv` and writes `outputs/training_metrics.png`
+with seven panels:
+
+| Panel | Content |
+|-------|---------|
+| A | Total loss — train vs val |
+| B | L_taxi — train vs val + baseline reference line |
+| C | Val L_cong only (train ~100× larger; excluded from scale) |
+| D | L_fill — train vs val |
+| E | Pareto-optimal val epochs (taxi vs cong, sized by fill) |
+| F | Generalisation gap (val − train) for taxi + fill |
+| G | Policy comparison bar chart — F3 hard-sim metrics (full-width) |
+
+---
+
+## Current Results
+
+### Training run (40 epochs, early stopping)
+
+| Metric | Best val epoch (ep 25) | Test set (ep 25) |
+|--------|----------------------|-----------------|
+| L_taxi (min) | ~5.80 | 5.764 |
+| L_cong (proxy) | ~0.81 | 0.743 |
+| L_fill (proxy) | ~0.17 | 0.192 |
+| Total loss | ~6.78 | 6.699 |
+
+Val metrics are computed with soft GNN probabilities; they are directly
+comparable to each other across epochs but not to the hard-sim F3 table.
+
+### F3 hard-simulator policy comparison (test split, Nov – Dec 2025)
+
+| Policy | Taxi time (min) | Queue wait (min) | Total delay (min) |
+|--------|----------------|-----------------|------------------|
+| GreedyCapacityAware (π₀) | 5.751 | 2.399 | **8.150** |
+| GNN Greedy (πθ, argmax) | 5.745 | 3.111 | 8.856 |
+| GNN + Safe Override (π\*) | 5.745 | 3.111 | 8.856 |
+
+**Interpretation:** GNN taxi times match the baseline (both optimise
+distance), but queue wait is higher (+0.71 min) because the GNN assigns
+flights independently at inference while `GreedyCapacityAware` tracks
+live slot utilisation per 30-min window.  This **coordination gap** is the
+primary remaining challenge: the soft congestion proxy improves during
+training (val L_cong falling from 1.63 → 0.74 over 40 epochs), but the
+GNN cannot communicate across flights at inference time.
 
 ---
 
@@ -293,34 +340,32 @@ python -m src.plot_poster    # regenerate all panels
 ECE538FP/
 ├── data/
 │   ├── raw/              nyc_master_2025.csv
-│   ├── meta/             gate_mapping.json · weather_ewr/lga.csv
-│   ├── geo/              ewr_layout.graphml · lga_layout.graphml
+│   ├── meta/             gate_mapping.json · terminal_zones.json
 │   └── processed/        final_node_features.csv · edges.csv  (generated)
 ├── src/
-│   ├── model.py          SpatioTemporalGNN (GATConv, HeteroConv)
-│   ├── loss.py           F1 / F2 / F3 / MultiObjectiveLoss
-│   ├── train.py          Training loop, temporal batching, Pareto logging
-│   ├── baseline.py       Greedy First-Fit policy (π₀)
-│   ├── safe_override.py  KT-guard + F1-feasibility policy (π*)
-│   ├── api.py            FastAPI inference server (Step 7)
-│   ├── plot_poster.py    Research-poster visualization suite (8 panels)
-│   ├── finalize_data.py  Feature engineering (node matrix + AT_EWR/AT_LGA)
-│   ├── graph_engine.py   Edge generation (turnaround + congestion)
+│   ├── model.py          SpatioTemporalGNN (HeteroConv, GATConv × 3 edge types)
+│   ├── loss.py           GateMasker · L_taxi · L_cong · L_fill · L_turn · MultiObjectiveLoss
+│   ├── train.py          Training loop, temporal batching, early stopping, Pareto logging
+│   ├── eval.py           Standalone evaluation (soft proxy + F3 hard-sim comparison)
+│   ├── baseline.py       GreedyFirstFit · simulate_queuing_f3 · score / score_soft
+│   ├── baselines.py      GreedyCapacityAware (single operational baseline)
+│   ├── safe_override.py  Confidence-filter + capacity-repair policy (π*)
+│   ├── plot_training.py  7-panel training-metrics figure
+│   ├── finalize_data.py  Feature engineering → final_node_features.csv
+│   ├── graph_engine.py   Edge generation (turnaround · congestion · same_terminal)
 │   ├── clean_weather.py  Weather normalisation
 │   ├── preprocess.py     BTS zip → nyc_master_2025.csv
 │   └── get_geo.py        Download airport GraphML from OSM
 ├── outputs/
-│   ├── best_model.pt               (generated after training)
-│   ├── feature_schema.json         (generated after training)
-│   ├── training_history.csv        (generated after training)
-│   ├── pareto_front.csv            (generated after training)
-│   ├── baseline_assignments.csv    Greedy π₀ assignments (all flights)
-│   ├── policy_comparison.csv       π₀ vs π* metric table
+│   ├── best_model.pt               Best val-loss checkpoint
+│   ├── training_history.csv        Per-epoch train/val losses (9 columns)
+│   ├── pareto_front.csv            Non-dominated val epochs
+│   ├── test_metrics.csv            Soft-proxy metrics on test split
+│   ├── policy_comparison.csv       F3 hard-sim: baseline vs GNN vs π*
 │   ├── safe_override_decisions.csv Per-flight π* decision log
-│   ├── gnn_visualization.png       6-panel EDA figure
-│   └── poster/                     8-panel research poster figures
+│   ├── baseline_assignments.csv    GreedyCapacityAware assignments
+│   └── training_metrics.png        7-panel training figure
 ├── requirements.txt
-├── install_pyg_deps.py   Auto-detects PyTorch version; installs C++ wheels
 └── README.md
 ```
 
@@ -334,124 +379,59 @@ ECE538FP/
 pip install -r requirements.txt
 ```
 
-**PyG C++ extension wheels** (optional speed-up; must match your PyTorch/CUDA):
+### 2. Build the processed dataset
 
 ```bash
-python install_pyg_deps.py   # auto-detects version and fetches correct wheels
-```
-
-### 2. Run the data pipeline
-
-```bash
-python src/clean_weather.py      # normalise weather CSVs
-python src/finalize_data.py      # merge features → final_node_features.csv
-python src/graph_engine.py       # build graph edges  → edges.csv
+python src/finalize_data.py   # merge features → final_node_features.csv
+python src/graph_engine.py    # build graph edges → edges.csv
 ```
 
 ### 3. Train
 
 ```bash
-python -m src.train \
-    --epochs 50 \
-    --batch_size 512 \
-    --num_heads 4 \
-    --window_hours 4 \
-    --hidden_channels 128 \
-    --alpha 1.0 --beta 1.0 --gamma 1.0
+python -m src.train --epochs 100 --batch_size 512
 ```
 
-### 4. Evaluate policies
+Outputs: `outputs/best_model.pt`, `outputs/training_history.csv`,
+`outputs/pareto_front.csv`.
+
+### 4. Evaluate
 
 ```bash
-python src/baseline.py                          # run π₀ on full dataset
-python src/safe_override.py --split test        # run π* on test split
+python -m src.eval
 ```
 
-### 5. Regenerate poster figures
+Outputs soft-proxy test metrics and F3 hard-sim policy comparison.
+
+### 5. Plot training metrics
 
 ```bash
-python -m src.plot_poster
+python src/plot_training.py
 ```
 
-### 6. Start inference API
+Outputs `outputs/training_metrics.png` (7 panels).
+
+### 6. Run baseline standalone
 
 ```bash
-uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+python src/baselines.py   # GreedyCapacityAware on full dataset
 ```
 
 ---
 
-## Current Results
+## Known Limitations
 
-### Completed
+**Coordination gap** — the GNN assigns each flight's gate class independently
+at inference (argmax of per-flight softmax), while the baseline sequences
+flights chronologically and tracks live slot utilisation.  Even if the model
+learns to reduce the *expected* congestion proxy during training, committed
+hard assignments can still concentrate load in popular gate classes within a
+departure window, raising the actual queue wait.
 
-| Task | Status |
-|------|--------|
-| Data engineering (141-feature node matrix) | ✅ Complete |
-| AT_EWR / AT_LGA arrival-gate flags | ✅ Complete |
-| GATConv model (upgraded from SAGEConv) | ✅ Complete |
-| Multi-objective loss (F1 + F2 + F3) | ✅ Complete |
-| Temporal mini-batch sorting | ✅ Complete |
-| Greedy First-Fit baseline (π₀) | ✅ Complete — F2=764 m, F3=20.92 min, 0 violations |
-| Kendall-Tau safe override (π*) | ✅ Complete — safety guard validated on 88k test flights |
-| FastAPI inference server | ✅ Complete — baseline fallback operational |
-| Research poster visualisations (8 panels) | ✅ Complete |
-
-### Training metrics
-
-Model training requires a GPU and has not yet been executed on this machine.
-Teammates are running the training pipeline.  The table below will be updated
-once `outputs/training_history.csv` and `outputs/pareto_front.csv` are available.
-
-| Epoch | F1 (test) | F2 (test) | F3 (test) | Policy |
-|-------|-----------|-----------|-----------|--------|
-| — | — | — | — | pending training run |
-
----
-
-## Remaining Steps
-
-The following items are needed to complete the project:
-
-### High priority
-
-1. **Run `graph_engine.py`** to generate `data/processed/edges.csv` — the GPU
-   machine should run this before training starts.  Without edges the graph is
-   disconnected and the GNN cannot propagate messages.
-
-2. **Full training run** — execute on the GPU machine:
-   ```bash
-   python -m src.train --epochs 50 --batch_size 512 --num_heads 4 --window_hours 4
-   ```
-   Expected outputs: `best_model.pt`, `feature_schema.json`,
-   `training_history.csv`, `pareto_front.csv`.
-
-3. **Policy comparison after training** — re-run π* with the trained checkpoint
-   to measure real GNN improvements over the baseline:
-   ```bash
-   python src/safe_override.py --checkpoint outputs/best_model.pt --k_max 0.05 --split test
-   ```
-
-4. **Update this README** with actual F1 / F2 / F3 epoch curves and the
-   Pareto-front table from the training run.
-
-### Medium priority
-
-5. **Hyperparameter sweep** — test at least three (α, β, γ) configurations to
-   explore Pareto trade-offs, e.g.:
-   - (2, 1, 1) — emphasise constraint satisfaction
-   - (1, 2, 1) — emphasise short taxi distances
-   - (1, 1, 2) — emphasise schedule stability
-
-6. **Training curve + Pareto scatter plot** — add a `src/plot_results.py` script
-   that reads `training_history.csv` and `pareto_front.csv` and produces
-   poster-ready figures (F1/F2/F3 vs epoch, 3-D Pareto scatter).
-
-### Lower priority
-
-7. **Ablation study** — compare GATConv vs the original SAGEConv architecture
-   to quantify the contribution of attention-based aggregation.
-
-8. **Supervised gate labels** — if real gate assignment records become available,
-   add a cross-entropy head on top of the GNN to provide a stronger F1 training
-   signal than the soft-penalty approach.
+**Potential mitigations:**
+- Post-processing slot-rebalancer (sequentially swap overloaded assignments
+  to the next-best gate class, similar to Safe Override's repair step)
+- Autoregressive inference: assign flights in departure-time order, feeding
+  back the running slot counts as a dynamic node feature
+- Training with a harder congestion signal (e.g. inject simulated slot counts
+  as a feature rather than relying solely on the soft proxy)
