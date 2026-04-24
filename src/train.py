@@ -87,11 +87,13 @@ DEFAULTS = dict(
     num_neighbors_l2 = 5,
     num_neighbors_l3 = 5,   # must match num_layers=3
     window_hours     = 4,
-    # Loss weights
+    # Loss weights — all components now in MINUTES; weights are unitless
+    # L_taxi + L_cong + L_fill ≈ hard-sim total (min) at convergence
     alpha            = 0.0,  # legacy (not used; kept for CLI compat)
-    beta             = 1.0,  # L_taxi weight
-    gamma            = 0.05, # L_turn (turnaround smoothness) weight
-    lam              = 0.5,  # L_cong (soft congestion proxy) weight
+    beta             = 1.0,  # L_taxi  weight (taxi minutes)
+    lam              = 1.0,  # L_cong  weight (queue minutes, M/D/K proxy)
+    eta              = 1.0,  # L_fill  weight (density-delay minutes)
+    gamma            = 0.05, # L_turn  weight (smoothness regulariser)
     delay_scale      = 30.0, # legacy (not used; kept for CLI compat)
     entropy_weight   = 0.0,  # legacy (not used; kept for CLI compat)
     delta            = 0.0,  # legacy (not used; kept for CLI compat)
@@ -225,7 +227,10 @@ def load_node_features(node_csv: Path, raw_csv: Path):
     is_at_ewr = is_at_ewr.astype(np.float32)
 
     # ── Widebody aircraft flag ────────────────────────────────────────────────
-    is_widebody = df.get("WIDEBODY", pd.Series(0, index=df.index)).fillna(0).astype(np.float32).values
+    _wb_raw = df.get("WIDEBODY", pd.Series(0, index=df.index))
+    if _wb_raw.dtype == object:
+        _wb_raw = (_wb_raw == "Yes").astype(np.int8)
+    is_widebody = _wb_raw.fillna(0).astype(np.float32).values
 
     # ── Feature matrix ──────────────────────────────────────────────────────
     skip = {"FL_DATE", "DEP_TIME", "DEP_DELAY"}
@@ -341,7 +346,7 @@ def build_hetero_data(
 def train_epoch(model, loader, optimizer, criterion, device,
                 carrier_ohe_all, is_at_ewr_all):
     model.train()
-    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0}
+    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0, "fill": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -370,7 +375,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
         c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
         ewr   = is_at_ewr_all[global_ids.cpu()].to(device)
 
-        loss, l_taxi, l_cong, l_turn = criterion(
+        loss, l_taxi, l_cong, l_fill, l_turn = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
             c_ohe, ewr, is_wide, dep_time_min, turn_src, turn_dst,
         )
@@ -386,6 +391,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
         totals["loss"] += loss.item()
         totals["taxi"] += l_taxi.item()
         totals["cong"] += l_cong.item()
+        totals["fill"] += l_fill.item()
         n_batches      += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -399,7 +405,7 @@ def train_epoch(model, loader, optimizer, criterion, device,
 def eval_epoch(model, loader, criterion, device,
                carrier_ohe_all, is_at_ewr_all):
     model.eval()
-    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0}
+    totals = {"loss": 0.0, "taxi": 0.0, "cong": 0.0, "fill": 0.0}
     n_batches = 0
 
     for batch in loader:
@@ -427,7 +433,7 @@ def eval_epoch(model, loader, criterion, device,
         c_ohe = carrier_ohe_all[global_ids.cpu()].to(device)
         ewr   = is_at_ewr_all[global_ids.cpu()].to(device)
 
-        loss, l_taxi, l_cong, l_turn = criterion(
+        loss, l_taxi, l_cong, l_fill, l_turn = criterion(
             gate_logits_s, delay_pred_s, delay_true_s,
             c_ohe, ewr, is_wide, dep_time_min, turn_src, turn_dst,
         )
@@ -438,6 +444,7 @@ def eval_epoch(model, loader, criterion, device,
         totals["loss"] += loss.item()
         totals["taxi"] += l_taxi.item()
         totals["cong"] += l_cong.item()
+        totals["fill"] += l_fill.item()
         n_batches      += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -604,6 +611,7 @@ def main():
         carrier_list      = carrier_list,
         alpha             = args.alpha,
         beta              = args.beta,
+        eta               = args.eta,
         gamma             = args.gamma,
         lam               = args.lam,
         delay_scale       = args.delay_scale,
@@ -656,12 +664,44 @@ def main():
     except Exception:
         pass
 
+    # ── Baseline policy pre-evaluation (reference before training starts) ───
+    from src.baselines import GreedyCapacityAware as _GCA           # noqa: E402
+    print("=" * 64)
+    print("  Baseline policy (GreedyCapacityAware) — simulator results")
+    print("=" * 64)
+    try:
+        _raw_df = pd.read_csv(RAW_CSV, low_memory=False)
+        _raw_df["FL_DATE"] = pd.to_datetime(_raw_df["FL_DATE"])
+        _gca = _GCA(str(GATE_MAP))
+
+        for _split_name, _month_filter in [
+            ("Train  (months 1-8) ", lambda m: m <= 8),
+            ("Val    (months 9-10)", lambda m: (m >= 9) & (m <= 10)),
+            ("Test   (months 11-12)", lambda m: m > 10),
+        ]:
+            _split_df  = _raw_df[_month_filter(_raw_df["FL_DATE"].dt.month)].reset_index(drop=True)
+            _split_asgn = _gca.assign(_split_df)
+            _split_met  = _gca.score(_split_asgn, _split_df)
+            print(f"  {_split_name} :  "
+                  f"taxi={_split_met['f3_taxi_min']:.3f} min  "
+                  f"queue={_split_met['f3_queue_min']:.3f} min  "
+                  f"total={_split_met['f3_total_min']:.3f} min  "
+                  f"[{_split_met['n_assigned']:,} assigned]")
+        del _raw_df, _gca, _split_df, _split_asgn, _split_met
+    except Exception as _e:
+        print(f"  (baseline pre-eval skipped: {_e})")
+    print("=" * 64)
+    print()
+
     # ── Training loop with early stopping on val loss ─────────────────────
-    print("=" * 88)
+    print("=" * 106)
     print("Constrained GNN Scheduler  |  gate masking enforced structurally (not as loss)")
-    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-Taxi':>8}  {'Tr-Cong':>8}"
-          f"  {'VaLoss':>8}  {'Va-Taxi':>8}  {'Va-Cong':>8}  {'*':>2}")
-    print("=" * 88)
+    print("  L_taxi is in MINUTES (same scale as hard-sim taxi time).")
+    print("  L_cong and L_fill are dimensionless differentiable proxies for queue/density delay.")
+    print("  Weights beta/lam/eta control relative importance; hard-sim comparison is at end.")
+    print(f"{'Ep':>4}  {'TrLoss':>8}  {'Tr-Taxi':>8}  {'Tr-Cong':>8}  {'Tr-Fill':>8}"
+          f"  {'VaLoss':>8}  {'Va-Taxi':>8}  {'Va-Cong':>8}  {'Va-Fill':>8}  {'*':>2}")
+    print("=" * 106)
 
     history         = []
     best_val_loss   = float("inf")
@@ -706,12 +746,12 @@ def main():
             no_improve += 1
 
         row = (epoch,
-               tr["loss"], tr["taxi"], tr["cong"],
-               va["loss"], va["taxi"], va["cong"])
+               tr["loss"], tr["taxi"], tr["cong"], tr["fill"],
+               va["loss"], va["taxi"], va["cong"], va["fill"])
         history.append(row)
 
-        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['taxi']:8.4f}  {tr['cong']:8.4f}"
-              f"  {va['loss']:8.4f}  {va['taxi']:8.4f}  {va['cong']:8.4f}  {marker}")
+        print(f"{epoch:4d}  {tr['loss']:8.4f}  {tr['taxi']:8.4f}  {tr['cong']:8.4f}  {tr['fill']:8.4f}"
+              f"  {va['loss']:8.4f}  {va['taxi']:8.4f}  {va['cong']:8.4f}  {va['fill']:8.4f}  {marker}")
 
         if no_improve >= args.patience:
             print(f"\nEarly stopping at epoch {epoch} "
@@ -725,28 +765,29 @@ def main():
                     carrier_ohe, is_at_ewr)
     print(f"\nTest  (best ckpt epoch {best_ckpt['epoch']}):"
           f"  L_taxi={te['taxi']:.4f}  L_cong={te['cong']:.4f}"
-          f"  Total={te['loss']:.4f}")
+          f"  L_fill={te['fill']:.4f}  Total={te['loss']:.4f}")
 
-    # ── Pareto front — 2 objectives: taxi loss and congestion proxy ────────
-    val_pts   = [(r[5], r[6]) for r in history]   # (va_taxi, va_cong)
+    # ── Pareto front — 3 objectives: taxi, congestion, fill proxy ─────────
+    val_pts   = [(r[6], r[7], r[8]) for r in history]   # (va_taxi, va_cong, va_fill)
     front_idx = pareto_front_indices(val_pts)
 
     pareto_rows = [
         {"epoch": history[i][0],
-         "val_taxi": history[i][5], "val_cong": history[i][6]}
+         "val_taxi": history[i][6], "val_cong": history[i][7],
+         "val_fill": history[i][8]}
         for i in front_idx
     ]
     pareto_df = pd.DataFrame(pareto_rows).sort_values("val_taxi")
     pareto_df.to_csv(OUT_DIR / "pareto_front.csv", index=False)
-    print("\nPareto-optimal epochs (val set, lower taxi and cong is better):")
+    print("\nPareto-optimal epochs (val set, lower taxi/cong/fill is better):")
     print(pareto_df.to_string(index=False))
 
     # Save full epoch history
     hist_df = pd.DataFrame(
         history,
         columns=["epoch",
-                 "train_loss", "train_taxi", "train_cong",
-                 "val_loss",   "val_taxi",   "val_cong"],
+                 "train_loss", "train_taxi", "train_cong", "train_fill",
+                 "val_loss",   "val_taxi",   "val_cong",   "val_fill"],
     )
     hist_df.to_csv(OUT_DIR / "training_history.csv", index=False)
 
@@ -756,6 +797,7 @@ def main():
         "test_loss"  : te["loss"],
         "test_taxi"  : te["taxi"],
         "test_cong"  : te["cong"],
+        "test_fill"  : te["fill"],
     }])
     test_row.to_csv(OUT_DIR / "test_metrics.csv", index=False)
 
@@ -780,20 +822,38 @@ def main():
         model, test_loader, criterion, device, carrier_ohe
     )
 
-    ordered_probs = np.full((len(test_df), NUM_GATES), 1.0 / NUM_GATES, dtype=np.float32)
+    # Map loader-local IDs back to test_df row indices.
+    # Guard against size mismatch between preprocessed CSV and raw CSV.
+    n_test_df = len(test_df)
+    ordered_probs = np.full((n_test_df, NUM_GATES), 1.0 / NUM_GATES, dtype=np.float32)
     for i, local_id in enumerate(seed_ids_np):
-        ordered_probs[int(local_id)] = gate_probs_np[i]
+        li = int(local_id)
+        if 0 <= li < n_test_df:
+            ordered_probs[li] = gate_probs_np[i]
 
-    carriers        = test_df["OP_UNIQUE_CARRIER"].values
-    airports        = np.where(test_df["ORIGIN"] == "EWR", "EWR", None)
-    widebody_test   = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index)).fillna(0).values
-    fl_dates_min    = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
-    dep_min_of_day  = ((test_df["CRS_DEP_TIME"].values // 100) * 60
-                       + (test_df["CRS_DEP_TIME"].values % 100))
+    carriers       = test_df["OP_UNIQUE_CARRIER"].values
+    airports       = np.where(test_df["ORIGIN"] == "EWR", "EWR", None)
+    _wb_test = test_df.get("WIDEBODY", pd.Series(0, index=test_df.index))
+    if _wb_test.dtype == object:
+        _wb_test = (_wb_test == "Yes").astype(np.int8)
+    widebody_test = _wb_test.fillna(0).values
+    fl_dates_min   = (pd.to_datetime(test_df["FL_DATE"]).astype(np.int64) // (10**6 * 60)).values
+    dep_min_of_day = ((test_df["CRS_DEP_TIME"].values // 100) * 60
+                      + (test_df["CRS_DEP_TIME"].values % 100))
     dep_times = (fl_dates_min + dep_min_of_day).astype(np.int64)
 
-    # Apply safe override with real model gate probabilities
-    override_policy  = SafeOverridePolicy()
+    is_ewr_arr = airports == "EWR"
+
+    # ── Policy 2: Pure GNN greedy (argmax of masked probs, no override) ──────
+    # Shows what the raw GNN assigns without any safety filtering.
+    gnn_pure_assigns = base_assigns.copy()
+    gnn_pure_assigns[is_ewr_arr] = (
+        ordered_probs[is_ewr_arr].argmax(axis=-1).astype(np.int8)
+    )
+    gnn_pure_metrics = base_policy.score(gnn_pure_assigns, test_df)
+
+    # ── Policy 3: GNN + Safe Override (confidence filter + capacity repair) ──
+    override_policy = SafeOverridePolicy()
     final_assigns, decision_log, override_stats = override_policy.apply(
         ordered_probs, base_assigns, carriers, airports, dep_times, widebody_test
     )
@@ -802,26 +862,27 @@ def main():
     def _pct(new, old):
         return f"{(new - old) / max(abs(old), 1e-9) * 100:>+7.1f}%"
 
-    # Print comparison table (GreedyCapacityAware | GNN π*)
-    print(f"\n  {'Metric':<35} {'Baseline':>10}  {'GNN pi*':>10}  {'Delta':>8}")
-    print("  " + "-" * 68)
-
+    # Print 3-way comparison table
+    print(f"\n  {'Metric':<30} {'Baseline':>9}  {'GNN Greedy':>10}  {'GNN+Override':>12}  {'Delta (OR)':>10}")
+    print("  " + "-" * 78)
     for key, label in [
-        ("f3_taxi_min",  "F3 taxi time (min)    "),
-        ("f3_queue_min", "F3 queue wait (min)   "),
-        ("f3_total_min", "F3 total delay (min)  "),
+        ("f3_taxi_min",  "F3 taxi time (min)   "),
+        ("f3_queue_min", "F3 queue wait (min)  "),
+        ("f3_total_min", "F3 total delay (min) "),
     ]:
         bv = base_metrics[key]
+        gv = gnn_pure_metrics[key]
         ov = override_metrics[key]
-        print(f"  {label:<35} {bv:>10.2f}  {ov:>10.2f}  {_pct(ov, bv):>8}")
+        print(f"  {label:<30} {bv:>9.2f}  {gv:>10.2f}  {ov:>12.2f}  {_pct(ov, bv):>10}")
 
     n = override_stats["n_total"]
     pct_stat = lambda k: f"{100 * override_stats[k] / max(n, 1):.1f}%"
-    print(f"\n  Accepted by GNN          : {override_stats['n_accepted_gnn']:,} ({pct_stat('n_accepted_gnn')})")
-    print(f"  Low confidence (baseline): {override_stats['n_low_confidence']:,} ({pct_stat('n_low_confidence')})")
-    print(f"  Capacity repaired        : {override_stats['n_capacity_repaired']:,}")
-    print(f"  Mean gate confidence     : {override_stats['mean_confidence']:.3f}")
-    print(f"  Conf threshold           : {override_stats['conf_threshold']}")
+    print(f"\n  GNN accepted (conf>={override_stats['conf_threshold']}) : "
+          f"{override_stats['n_accepted_gnn']:,} ({pct_stat('n_accepted_gnn')})")
+    print(f"  Low confidence (kept baseline)  : "
+          f"{override_stats['n_low_confidence']:,} ({pct_stat('n_low_confidence')})")
+    print(f"  Capacity repaired               : {override_stats['n_capacity_repaired']:,}")
+    print(f"  Mean gate confidence            : {override_stats['mean_confidence']:.3f}")
 
     # Save outputs
     decision_log.to_csv(OUT_DIR / "safe_override_decisions.csv", index=False)
@@ -830,7 +891,11 @@ def main():
          "f3_taxi_min": base_metrics["f3_taxi_min"],
          "f3_queue_min": base_metrics["f3_queue_min"],
          "f3_total_min": base_metrics["f3_total_min"]},
-        {"policy": "GNN Safe Override",
+        {"policy": "GNN Greedy",
+         "f3_taxi_min": gnn_pure_metrics["f3_taxi_min"],
+         "f3_queue_min": gnn_pure_metrics["f3_queue_min"],
+         "f3_total_min": gnn_pure_metrics["f3_total_min"]},
+        {"policy": "GNN + Safe Override",
          "f3_taxi_min": override_metrics["f3_taxi_min"],
          "f3_queue_min": override_metrics["f3_queue_min"],
          "f3_total_min": override_metrics["f3_total_min"]},

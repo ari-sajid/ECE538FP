@@ -81,8 +81,23 @@ FALLBACK_GATE = {
 # Queueing simulation constants
 # ---------------------------------------------------------------------------
 TAXI_SPEED_M_PER_MIN   = 200.0   # ~12 km/h conservative ground speed
-MIN_TURNAROUND_MIN     = 45.0    # gate occupied this long before next departure
-GATE_OCCUPY_WINDOW_MIN = 120.0   # total gate occupancy window per flight
+MIN_TURNAROUND_MIN     = 45.0    # gate slot requested this many min before departure
+GATE_OCCUPY_WINDOW_MIN = 60.0    # total slot hold time per flight (45 min pre-dep + 15 min cleanup)
+                                  # ρ_peak = 70 ops/hr / (105 slots × 1/hr) = 0.67 < 1  ✓
+
+# Density-delay constants: planes parked near each other reduce maneuvering speed.
+# Extra delay = DENSITY_FACTOR * max(0, fill_ratio - DENSITY_THRESHOLD)^2
+DENSITY_FACTOR    = 8.0    # max extra minutes at full (100%) zone occupancy
+DENSITY_THRESHOLD = 0.30   # fill fraction below which no penalty applies
+DENSITY_WINDOW_MIN = 60.0  # look-around window for concurrent occupancy count
+
+
+def _wb_int(series: pd.Series) -> np.ndarray:
+    """Convert WIDEBODY column (Yes/No strings, Categorical, or 0/1 numeric) → int8."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).to_numpy(dtype=np.int8)
+    # object or Categorical with 'Yes'/'No' values
+    return (series == "Yes").to_numpy(dtype=np.int8)
 
 
 def simulate_queuing_f3(
@@ -91,12 +106,17 @@ def simulate_queuing_f3(
     is_widebody_arr: np.ndarray,  # [N] 1 = widebody, 0 = narrowbody
 ) -> np.ndarray:
     """
-    Slot-based M/D/K queueing simulation.
+    Slot-based M/D/K queueing simulation with density-proximity penalty.
 
     Each gate class has GATE_SLOTS[class] independent NB-equivalent slots.
     Widebody aircraft consume 2 consecutive slots; narrowbody consumes 1.
     Flights sorted by dep_time; each requests slots MIN_TURNAROUND_MIN before
     scheduled departure.  If insufficient slots are free: wait.
+
+    Additionally, a density delay is added: when many planes occupy the same
+    gate zone concurrently (within DENSITY_WINDOW_MIN), reduced maneuvering
+    room slows ground operations.  Penalty is quadratic in fill ratio above
+    DENSITY_THRESHOLD.
 
     Returns
     -------
@@ -129,6 +149,34 @@ def simulate_queuing_f3(
             free_list[s] = t_start + GATE_OCCUPY_WINDOW_MIN
         free_list.sort()
 
+    # ── Density-proximity delay post-pass ────────────────────────────────────
+    # For each gate class, count how many flights depart within DENSITY_WINDOW_MIN
+    # of each other (concurrent ground presence) and penalise high fill ratios.
+    dep_arr = dep_times_min.astype(np.float64)
+    density_delays = np.zeros(len(assignments), dtype=np.float64)
+
+    for g_idx in range(NUM_GATES):
+        g_mask    = (assignments == g_idx)
+        if not g_mask.any():
+            continue
+        g_indices = np.where(g_mask)[0]
+        g_times   = dep_arr[g_indices]                  # [Ng]
+        total_slots = float(GATE_SLOTS[GATE_CLASSES[g_idx]])
+
+        # Sorted binary-search sliding window — O(N log N), O(N) memory.
+        # For each flight, count how many others depart within DENSITY_WINDOW_MIN
+        # without materialising an [Ng, Ng] matrix.
+        sort_ord     = np.argsort(g_times)
+        sorted_t     = g_times[sort_ord]
+        lo = np.searchsorted(sorted_t, sorted_t - DENSITY_WINDOW_MIN, side="left")
+        hi = np.searchsorted(sorted_t, sorted_t + DENSITY_WINDOW_MIN, side="right")
+        concurrent   = (hi - lo).astype(np.float64)      # [Ng]
+
+        fill_ratio = concurrent / total_slots
+        excess     = np.maximum(0.0, fill_ratio - DENSITY_THRESHOLD)
+        density_delays[g_indices[sort_ord]] = DENSITY_FACTOR * excess ** 2
+
+    wait_times += density_delays
     return wait_times
 
 
@@ -200,12 +248,13 @@ class GreedyFirstFit:
         assignments : ndarray[int], shape (N,)
             Gate class index 0-4 per flight, or UNASSIGNED (-1).
         """
-        sort_idx  = np.lexsort((df["CRS_DEP_TIME"].values, df["FL_DATE"].values))
+        crs_dep   = pd.to_numeric(df["CRS_DEP_TIME"], errors="coerce").fillna(0).astype(int)
+        sort_idx  = np.lexsort((crs_dep.values, df["FL_DATE"].values))
         sorted_df = df.iloc[sort_idx].reset_index(drop=True)
 
         assignments = np.full(len(sorted_df), UNASSIGNED, dtype=np.int8)
 
-        widebody_col = sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index))
+        widebody_arr = _wb_int(sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index)))
 
         for i, row in sorted_df.iterrows():
             airport = self._resolve_airport(row)
@@ -213,7 +262,7 @@ class GreedyFirstFit:
                 continue
 
             carrier   = row["OP_UNIQUE_CARRIER"]
-            is_wide   = bool(widebody_col.iloc[i])
+            is_wide   = bool(widebody_arr[i])
             key       = (carrier, airport)
             candidates = self.valid_gates.get(key, [])
 
@@ -253,7 +302,7 @@ class GreedyFirstFit:
         N = len(df)
         assigned_mask = assignments != UNASSIGNED
 
-        widebody_arr = df.get("WIDEBODY", pd.Series(0, index=df.index)).fillna(0).values
+        widebody_arr = _wb_int(df.get("WIDEBODY", pd.Series(0, index=df.index)))
 
         # ── F1: gate-constraint violations ──────────────────────────────────────
         violations = 0

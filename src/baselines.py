@@ -27,7 +27,7 @@ from src.baseline import (                          # noqa: E402
     GATE_CLASSES, GATE_TO_IDX,
     APPROX_DIST_M, FALLBACK_GATE, AIRPORT_GATE_ORDER,
     GATE_SLOTS, IS_NARROW_GATE,
-    UNASSIGNED,
+    UNASSIGNED, _wb_int,
 )
 
 RAW_CSV  = ROOT / "data" / "raw"  / "nyc_master_2025.csv"
@@ -61,14 +61,16 @@ class GreedyCapacityAware(GreedyFirstFit):
     ALPHA        = 0.4   # weight of distance vs slot utilization
 
     def assign(self, df: pd.DataFrame) -> np.ndarray:
-        sort_idx  = np.lexsort((df["CRS_DEP_TIME"].values, df["FL_DATE"].values))
+        crs_dep = pd.to_numeric(df["CRS_DEP_TIME"], errors="coerce").fillna(0).astype(int)
+        sort_idx  = np.lexsort((crs_dep.values, df["FL_DATE"].values))
         sorted_df = df.iloc[sort_idx].reset_index(drop=True)
+        sorted_crs_dep = crs_dep.values[sort_idx]   # already int, avoids row["CRS_DEP_TIME"] cast
         assignments = np.full(len(sorted_df), UNASSIGNED, dtype=np.int8)
 
         # load_units[(gate_idx, bucket)] = slot-units assigned so far
         load_units: dict = defaultdict(int)
 
-        widebody_col = sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index))
+        widebody_arr = _wb_int(sorted_df.get("WIDEBODY", pd.Series(0, index=sorted_df.index)))
 
         for i, row in sorted_df.iterrows():
             airport = self._resolve_airport(row)
@@ -76,9 +78,9 @@ class GreedyCapacityAware(GreedyFirstFit):
                 continue
 
             carrier   = row["OP_UNIQUE_CARRIER"]
-            is_wide   = bool(widebody_col.iloc[i])
+            is_wide   = bool(widebody_arr[i])
             key       = (carrier, airport)
-            bucket    = int(row["CRS_DEP_TIME"]) // 30
+            bucket    = sorted_crs_dep[i] // 30
             candidates = list(self.valid_gates.get(key, []))
 
             if is_wide:
